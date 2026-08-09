@@ -3,6 +3,7 @@
 #include "whyrun/event.hpp"
 
 #include <sqlite3.h>
+#include <unistd.h>
 
 #include <algorithm>
 #include <cctype>
@@ -13,6 +14,7 @@
 #include <sstream>
 #include <stdexcept>
 #include <string_view>
+#include <system_error>
 #include <utility>
 #include <vector>
 
@@ -410,6 +412,49 @@ std::filesystem::path default_capsule_path() {
         candidate = base.str() + '-' + std::to_string(suffix) + ".wrun";
     }
     return candidate;
+}
+
+std::filesystem::path temporary_capsule_path(std::string_view run_id) {
+    std::error_code error;
+    const auto directory = std::filesystem::temp_directory_path(error);
+    if (error) {
+        throw std::system_error(error, "locate temporary directory");
+    }
+
+    const std::string base = ".whyrun-" + std::string(run_id) + '-' +
+                             std::to_string(getpid());
+    for (unsigned int suffix = 0;; ++suffix) {
+        const std::string name = base + (suffix == 0 ? std::string{} :
+                                                       '-' + std::to_string(suffix)) +
+                                 ".tmp";
+        const auto candidate = directory / name;
+        if (!std::filesystem::exists(candidate, error)) {
+            if (error) {
+                throw std::system_error(error, "inspect temporary capsule path");
+            }
+            return candidate;
+        }
+        if (error) {
+            throw std::system_error(error, "inspect temporary capsule path");
+        }
+    }
+}
+
+void publish_capsule(const std::filesystem::path& temporary_path,
+                     const std::filesystem::path& final_path) {
+    std::error_code error;
+    const bool copied = std::filesystem::copy_file(
+        temporary_path, final_path, std::filesystem::copy_options::none, error);
+    if (!copied) {
+        if (!error) {
+            error = std::make_error_code(std::errc::file_exists);
+        }
+        throw std::system_error(error, "publish capsule " + final_path.string());
+    }
+
+    // Collection has ended before the final path is created, so the tracee cannot
+    // observe either the capsule or SQLite's rollback journal in its working tree.
+    std::filesystem::remove(temporary_path, error);
 }
 
 std::string format_command(const std::vector<std::string>& command) {

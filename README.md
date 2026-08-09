@@ -96,6 +96,11 @@ SQLite capsule -> show summary / event timeline
 two capsules   -> aggregate diff
 ```
 
+The SQLite database is built in the system temporary directory and published
+under its final `.wrun` name only after collection finishes. This prevents the
+recorded command from observing WhyRun's capsule or rollback journal in its
+working directory.
+
 `Collector` is an abstract interface. The CLI constructs the current
 `PtraceCollector`, but storage and comparison code never depend on ptrace.
 
@@ -120,8 +125,9 @@ alongside their positive errno value.
   tracked.
 - Relative `openat` paths need a known directory FD opened with `O_DIRECTORY`;
   otherwise the capsule keeps an explicit `<dirfd:N>/...` unresolved path.
-- Network collection covers `socket` plus IPv4/IPv6 `connect`; it does not do
-  DNS correlation, packet capture, TLS inspection, or socket namespace mapping.
+- Network collection covers `socket` plus IPv4/IPv6 `connect`. Unix-domain
+  connects are decoded separately as local IPC. WhyRun does not do DNS
+  correlation, packet capture, TLS inspection, or socket namespace mapping.
 - Namespace and container path translation is not complete.
 - A process that changes working directory through covered `chdir` or `fchdir`
   calls is tracked, but mount namespace changes are not interpreted.
@@ -133,4 +139,3 @@ alongside their positive errno value.
 - Add an optional eBPF collector behind the existing `Collector` interface.
 - Extend capsule compatibility and diff policies without requiring external
   databases or services.
-

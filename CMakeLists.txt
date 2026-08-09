@@ -39,6 +39,7 @@ if(BUILD_TESTING)
     add_executable(test_file tests/test_file.cpp)
     add_executable(test_child tests/test_child.cpp)
     add_executable(test_network tests/test_network.cpp)
+    add_executable(test_unix tests/test_unix.cpp)
 
     add_test(
         NAME integration
@@ -47,6 +48,7 @@ if(BUILD_TESTING)
                 $<TARGET_FILE:test_file>
                 $<TARGET_FILE:test_child>
                 $<TARGET_FILE:test_network>
+                $<TARGET_FILE:test_unix>
                 ${CMAKE_CURRENT_BINARY_DIR}/integration-work
     )
 endif()

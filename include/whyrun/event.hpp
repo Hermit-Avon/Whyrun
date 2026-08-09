@@ -16,6 +16,7 @@ enum class EventType {
     FileRead,
     FileWrite,
     NetworkConnect,
+    LocalIpcConnect,
 };
 
 struct Event {
@@ -38,4 +39,3 @@ public:
 };
 
 }  // namespace whyrun
-

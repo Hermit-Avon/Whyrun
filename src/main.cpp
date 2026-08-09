@@ -7,9 +7,32 @@
 #include <iostream>
 #include <string>
 #include <string_view>
+#include <utility>
 #include <vector>
 
 namespace {
+
+class TemporaryCapsuleGuard {
+public:
+    explicit TemporaryCapsuleGuard(std::filesystem::path path)
+        : path_(std::move(path)) {}
+
+    ~TemporaryCapsuleGuard() {
+        if (active_) {
+            std::error_code error;
+            std::filesystem::remove(path_, error);
+        }
+    }
+
+    TemporaryCapsuleGuard(const TemporaryCapsuleGuard&) = delete;
+    TemporaryCapsuleGuard& operator=(const TemporaryCapsuleGuard&) = delete;
+
+    void release() { active_ = false; }
+
+private:
+    std::filesystem::path path_;
+    bool active_{true};
+};
 
 std::uint64_t now_ns() {
     return static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
@@ -44,10 +67,17 @@ int record_command(int argc, char** argv) {
                                  cwd_error ? std::string{} : cwd.string(), start};
 
     try {
-        whyrun::CapsuleWriter writer(capsule_path, metadata);
-        auto collector = whyrun::make_ptrace_collector();
-        const auto result = collector->collect(command, writer);
-        writer.finish(result);
+        const auto temporary_path = whyrun::temporary_capsule_path(metadata.id);
+        TemporaryCapsuleGuard temporary_guard(temporary_path);
+        whyrun::CollectionResult result;
+        {
+            whyrun::CapsuleWriter writer(temporary_path, metadata);
+            auto collector = whyrun::make_ptrace_collector();
+            result = collector->collect(command, writer);
+            writer.finish(result);
+        }
+        whyrun::publish_capsule(temporary_path, capsule_path);
+        temporary_guard.release();
         if (!result.collector_ok) {
             std::cerr << "whyrun record: " << result.error << '\n';
             std::cerr << "partial capsule: " << capsule_path.string() << '\n';

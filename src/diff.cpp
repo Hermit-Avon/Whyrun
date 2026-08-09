@@ -25,6 +25,7 @@ struct Summary {
     std::map<std::string, Counts> reads;
     std::map<std::string, Counts> writes;
     std::map<std::string, Counts> network;
+    std::map<std::string, Counts> local_ipc;
     std::set<std::string> executables;
 };
 
@@ -61,6 +62,17 @@ Summary load_summary(const std::filesystem::path& path) {
     while (network.next()) {
         summary.network[network.text(0)] = Counts{
             network.integer(1), network.integer(2), network.integer(3), 0};
+    }
+
+    detail::ReadStatement local_ipc(
+        database.get(),
+        "SELECT resource, COUNT(*), "
+        "SUM(CASE WHEN errno_value=0 THEN 1 ELSE 0 END), "
+        "SUM(CASE WHEN errno_value>0 THEN 1 ELSE 0 END) "
+        "FROM events WHERE type='local_ipc_connect' GROUP BY resource");
+    while (local_ipc.next()) {
+        summary.local_ipc[local_ipc.text(0)] = Counts{
+            local_ipc.integer(1), local_ipc.integer(2), local_ipc.integer(3), 0};
     }
 
     detail::ReadStatement processes(
@@ -156,6 +168,12 @@ int diff_capsules(const std::filesystem::path& before,
         }
         std::cout << '\n';
 
+        std::cout << "Local IPC\n";
+        if (!print_activity_diff("", a.local_ipc, b.local_ipc, true)) {
+            std::cout << "  none\n";
+        }
+        std::cout << '\n';
+
         std::cout << "Processes\n";
         if (!print_set_diff(a.executables, b.executables)) {
             std::cout << "  none\n";
@@ -168,4 +186,3 @@ int diff_capsules(const std::filesystem::path& before,
 }
 
 }  // namespace whyrun
-

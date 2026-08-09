@@ -6,6 +6,7 @@
 #include <filesystem>
 #include <memory>
 #include <string>
+#include <string_view>
 #include <vector>
 
 namespace whyrun {
@@ -36,7 +37,9 @@ private:
 };
 
 std::filesystem::path default_capsule_path();
+std::filesystem::path temporary_capsule_path(std::string_view run_id);
+void publish_capsule(const std::filesystem::path& temporary_path,
+                     const std::filesystem::path& final_path);
 std::string format_command(const std::vector<std::string>& command);
 
 }  // namespace whyrun
-

@@ -98,6 +98,28 @@ void show_network(sqlite3* database) {
     std::cout << '\n';
 }
 
+void show_local_ipc(sqlite3* database) {
+    std::cout << "Local IPC\n";
+    detail::ReadStatement statement(
+        database,
+        "SELECT resource, COUNT(*), "
+        "SUM(CASE WHEN errno_value=0 THEN 1 ELSE 0 END), "
+        "SUM(CASE WHEN errno_value>0 THEN 1 ELSE 0 END) "
+        "FROM events WHERE type='local_ipc_connect' "
+        "GROUP BY resource ORDER BY resource");
+    bool any = false;
+    while (statement.next()) {
+        any = true;
+        std::cout << "  " << statement.text(0) << " (" << statement.integer(1)
+                  << " attempts, " << statement.integer(2) << " succeeded, "
+                  << statement.integer(3) << " failed)\n";
+    }
+    if (!any) {
+        std::cout << "  none\n";
+    }
+    std::cout << '\n';
+}
+
 void show_errors(sqlite3* database) {
     std::cout << "Errors\n";
     detail::ReadStatement statement(
@@ -108,8 +130,10 @@ void show_errors(sqlite3* database) {
     while (statement.next()) {
         any = true;
         std::string operation = statement.text(1);
-        const auto separator = operation.find('_');
-        if (separator != std::string::npos) {
+        if (operation.ends_with("_connect")) {
+            operation = "connect";
+        } else if (const auto separator = operation.find('_');
+                   separator != std::string::npos) {
             operation.erase(0, separator + 1);
         }
         std::cout << "  " << statement.text(0) << '\n'
@@ -180,6 +204,7 @@ int show_capsule(const std::filesystem::path& path, bool show_events) {
 
         show_files(database.get());
         show_network(database.get());
+        show_local_ipc(database.get());
         show_errors(database.get());
         if (show_events) {
             show_timeline(database.get(), start_ns);
@@ -192,4 +217,3 @@ int show_capsule(const std::filesystem::path& path, bool show_events) {
 }
 
 }  // namespace whyrun
-

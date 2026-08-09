@@ -20,6 +20,8 @@ std::string_view event_type_name(EventType type) {
             return "file_write";
         case EventType::NetworkConnect:
             return "network_connect";
+        case EventType::LocalIpcConnect:
+            return "local_ipc_connect";
     }
     throw std::logic_error("unknown event type");
 }

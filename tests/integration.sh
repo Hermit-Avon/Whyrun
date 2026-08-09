@@ -5,7 +5,9 @@ whyrun=$1
 test_file=$2
 test_child=$3
 test_network=$4
-work=$5
+test_unix=$5
+work_root=$6
+work="$work_root/run-$$"
 
 mkdir -p "$work"
 cd "$work"
@@ -36,5 +38,29 @@ network_capsule=$(ls -1t run-*.wrun | head -1)
 grep -q '127.0.0.1:1' network.show
 grep -q 'ECONNREFUSED' network.show
 
+unix_path="$work/missing.sock"
+"$whyrun" record -- "$test_unix" "$unix_path" > unix.log
+unix_capsule=$(ls -1t run-*.wrun | head -1)
+"$whyrun" show "$unix_capsule" --events > unix.show
+grep -q 'Local IPC' unix.show
+grep -q "unix:$unix_path" unix.show
+grep -q 'local_ipc_connect' unix.show
+grep -q 'connect -> ENOENT' unix.show
+if grep -q '<sockaddr:family=1>' unix.show; then
+    exit 1
+fi
+"$whyrun" diff "$true_capsule" "$unix_capsule" > unix.diff
+grep -q "^+ unix:$unix_path" unix.diff
+
 "$whyrun" diff "$true_capsule" "$file_capsule" > result.diff
 grep -q '^+ WRITE ' result.diff
+
+visibility="$work/visibility"
+mkdir -p "$visibility"
+cd "$visibility"
+"$whyrun" record -- /bin/sh -c "/bin/ls -la > '$work/observed-directory.txt'" \
+    > "$work/visibility.log"
+ls run-*.wrun > /dev/null
+if grep -Eq '(run-.*\.wrun|\.wrun-journal|\.whyrun-)' "$work/observed-directory.txt"; then
+    exit 1
+fi

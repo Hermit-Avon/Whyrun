@@ -8,12 +8,17 @@
 #include <sys/ptrace.h>
 #include <sys/socket.h>
 #include <sys/syscall.h>
+#include <sys/un.h>
 
 #include <algorithm>
 #include <cerrno>
+#include <cctype>
+#include <cstddef>
 #include <cstring>
 #include <filesystem>
+#include <iomanip>
 #include <limits>
+#include <optional>
 #include <sstream>
 #include <system_error>
 
@@ -47,50 +52,102 @@ std::string normalize_path(const std::filesystem::path& path) {
     return normalized;
 }
 
-std::string socket_endpoint(const TraceeMemory& memory, pid_t tid,
-                            std::uint64_t address, std::uint64_t length,
-                            std::string& family_name) {
+struct SocketEndpoint {
+    EventType event_type{EventType::NetworkConnect};
+    std::string resource;
+    std::string family_name;
+};
+
+std::string render_unix_name(const char* path, std::size_t length) {
+    if (length == 0) {
+        return "unix:<unnamed>";
+    }
+
+    const bool abstract = path[0] == '\0';
+    const std::size_t begin = abstract ? 1 : 0;
+    std::size_t end = length;
+    if (!abstract) {
+        const auto* terminator = static_cast<const char*>(std::memchr(path, '\0', length));
+        if (terminator != nullptr) {
+            end = static_cast<std::size_t>(terminator - path);
+        }
+    }
+
+    std::ostringstream output;
+    output << "unix:" << (abstract ? "@" : "");
+    for (std::size_t index = begin; index < end; ++index) {
+        const auto character = static_cast<unsigned char>(path[index]);
+        if (std::isprint(character) != 0 && character != '\\') {
+            output << static_cast<char>(character);
+        } else {
+            output << "\\x" << std::hex << std::setw(2) << std::setfill('0')
+                   << static_cast<unsigned int>(character) << std::dec;
+        }
+    }
+    return output.str();
+}
+
+std::optional<SocketEndpoint> socket_endpoint(const TraceeMemory& memory, pid_t tid,
+                                              std::uint64_t address,
+                                              std::uint64_t length) {
     if (address == 0 || length < sizeof(sa_family_t)) {
-        family_name = "unknown";
-        return "<invalid-sockaddr>";
+        return SocketEndpoint{EventType::NetworkConnect, "<invalid-sockaddr>",
+                              "unknown"};
     }
 
     sa_family_t family{};
     if (!memory.read_bytes(tid, address, &family, sizeof(family))) {
-        family_name = "unreadable";
-        return unreadable_address(address);
+        return SocketEndpoint{EventType::NetworkConnect, unreadable_address(address),
+                              "unreadable"};
     }
 
     char buffer[INET6_ADDRSTRLEN]{};
     if (family == AF_INET && length >= sizeof(sockaddr_in)) {
         sockaddr_in value{};
         if (!memory.read_bytes(tid, address, &value, sizeof(value))) {
-            family_name = "inet";
-            return unreadable_address(address);
+            return SocketEndpoint{EventType::NetworkConnect, unreadable_address(address),
+                                  "inet"};
         }
         if (inet_ntop(AF_INET, &value.sin_addr, buffer, sizeof(buffer)) == nullptr) {
-            return "<invalid-ipv4>";
+            return SocketEndpoint{EventType::NetworkConnect, "<invalid-ipv4>", "inet"};
         }
-        family_name = "inet";
-        return std::string(buffer) + ':' + std::to_string(ntohs(value.sin_port));
+        return SocketEndpoint{EventType::NetworkConnect,
+                              std::string(buffer) + ':' +
+                                  std::to_string(ntohs(value.sin_port)),
+                              "inet"};
     }
 
     if (family == AF_INET6 && length >= sizeof(sockaddr_in6)) {
         sockaddr_in6 value{};
         if (!memory.read_bytes(tid, address, &value, sizeof(value))) {
-            family_name = "inet6";
-            return unreadable_address(address);
+            return SocketEndpoint{EventType::NetworkConnect, unreadable_address(address),
+                                  "inet6"};
         }
         if (inet_ntop(AF_INET6, &value.sin6_addr, buffer, sizeof(buffer)) == nullptr) {
-            return "<invalid-ipv6>";
+            return SocketEndpoint{EventType::NetworkConnect, "<invalid-ipv6>",
+                                  "inet6"};
         }
-        family_name = "inet6";
-        return '[' + std::string(buffer) + "]:" +
-               std::to_string(ntohs(value.sin6_port));
+        return SocketEndpoint{EventType::NetworkConnect,
+                              '[' + std::string(buffer) + "]:" +
+                                  std::to_string(ntohs(value.sin6_port)),
+                              "inet6"};
     }
 
-    family_name = std::to_string(family);
-    return "<sockaddr:family=" + std::to_string(family) + '>';
+    if (family == AF_UNIX) {
+        sockaddr_un value{};
+        const auto read_size = static_cast<std::size_t>(
+            std::min<std::uint64_t>(length, sizeof(value)));
+        if (!memory.read_bytes(tid, address, &value, read_size)) {
+            return SocketEndpoint{EventType::LocalIpcConnect,
+                                  unreadable_address(address), "unix"};
+        }
+        constexpr std::size_t path_offset = offsetof(sockaddr_un, sun_path);
+        const std::size_t path_length = read_size > path_offset ? read_size - path_offset : 0;
+        return SocketEndpoint{EventType::LocalIpcConnect,
+                              render_unix_name(value.sun_path, path_length), "unix"};
+    }
+
+    return std::nullopt;
 }
 
 std::string child_kind(unsigned int ptrace_event) {
@@ -350,18 +407,20 @@ void ExecutionState::on_syscall_exit(const RawSyscall& syscall) {
 
     if (syscall.number == __NR_connect) {
         const int fd = static_cast<int>(syscall.args[0]);
-        std::string family;
         const auto endpoint = socket_endpoint(memory_, syscall.tid, syscall.args[1],
-                                              syscall.args[2], family);
-        auto event = make_event(EventType::NetworkConnect, endpoint, syscall.result);
+                                              syscall.args[2]);
+        if (!endpoint.has_value()) {
+            return;
+        }
+        auto event = make_event(endpoint->event_type, endpoint->resource, syscall.result);
         event.metadata["operation"] = "connect";
         event.metadata["fd"] = std::to_string(fd);
-        event.metadata["family"] = std::move(family);
+        event.metadata["family"] = endpoint->family_name;
         emit(event);
 
         const auto found = process->fd_table.find(fd);
         if (found != process->fd_table.end() && found->second.type == ResourceType::Socket) {
-            found->second.name = endpoint;
+            found->second.name = endpoint->resource;
         }
         return;
     }
