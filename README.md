@@ -29,6 +29,20 @@ The kernel must permit a process to trace its own children. This normally works
 without root. Hardened ptrace policies, seccomp profiles, and some container
 runtimes may require adjusted permissions or `sudo`.
 
+## Release
+
+Pushing a version tag matching `v*` runs the release workflow. It builds and
+tests WhyRun on Ubuntu 22.04, verifies that the tag matches `whyrun --version`,
+and publishes a GitHub Release with a Linux x86_64 tarball and SHA-256 checksum.
+
+The workflow must be committed before creating the tag:
+
+```bash
+git tag -a v0.1.0 -m "WhyRun v0.1.0"
+git push origin main
+git push origin v0.1.0
+```
+
 ## Usage
 
 Record a command:
