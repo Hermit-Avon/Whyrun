@@ -1,6 +1,7 @@
 cmake_minimum_required(VERSION 3.16)
 
 project(WhyRun VERSION 0.1.0 LANGUAGES CXX)
+set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
 if(NOT CMAKE_SYSTEM_NAME STREQUAL "Linux")
     message(FATAL_ERROR "WhyRun v0.1 supports Linux only")
