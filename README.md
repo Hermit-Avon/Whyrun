@@ -1,123 +1,168 @@
 # WhyRun
 
-WhyRun records what a Linux process actually did, normalizes low-level kernel
-activity into semantic execution events, and stores a command or interactive
-session as a portable capsule that can be inspected or compared with another run.
+WhyRun is a semantic execution recorder for Linux. It captures what a command or
+interactive shell session actually does and saves the result as a self-contained
+`.wrun` capsule that can be inspected or compared later.
 
-WhyRun v0.1 is a working x86_64 Linux prototype. It uses `ptrace` as its
-collector backend and SQLite as its capsule format. Future versions may add an
-eBPF collector without changing the CLI, event sink, storage, or diff layers.
+Instead of presenting raw system calls, WhyRun organizes observed activity into
+useful concepts such as processes, file reads and writes, network connections,
+local IPC, exit status, and errors.
 
-## Build
+WhyRun currently supports Linux x86_64.
 
-Ubuntu 22.04 or newer needs a C++20 compiler, CMake, and SQLite3 development
+## Features
+
+- **Record one command or a complete shell session.** Follow the full process
+  tree, including child and background processes.
+- **Understand filesystem activity.** See which paths were read or written,
+  along with call counts and observed byte totals.
+- **Inspect connections and local IPC.** Capture IPv4/IPv6 connection attempts
+  and Unix-domain socket activity.
+- **Find failures quickly.** Associate failed operations with Linux error names
+  such as `ENOENT` and `ECONNREFUSED`.
+- **View a semantic timeline.** Inspect ordered process, file, network, and error
+  events without reading a syscall trace.
+- **Attribute session activity to commands.** Select one command from an
+  interactive session and view only its process tree and effects.
+- **Compare two executions.** Highlight changes in exit status, commands,
+  executables, files, network endpoints, and local IPC.
+- **Keep portable run artifacts.** Each capsule is a single SQLite-backed file
+  that can be archived, shared, or attached to a bug report.
+- **Run locally.** Recording and inspection do not require an external service.
+
+## Use Cases
+
+WhyRun is useful when you need to answer questions such as:
+
+- Why did a command fail on one machine but succeed on another?
+- Which configuration files, inputs, or executables did a build or test use?
+- What changed between a successful run and a failed run?
+- Which process created or modified an unexpected file?
+- Which endpoint did a tool try to connect to?
+- What did each command in a troubleshooting session change or access?
+
+It works well for debugging command-line tools, investigating CI failures,
+understanding build and installation scripts, comparing environments, and
+capturing reproducible evidence for bug reports.
+
+WhyRun observes a process; it does not sandbox it or prevent side effects.
+
+## Installation
+
+### Prebuilt release
+
+Download the Linux x86_64 archive and its checksum from
+[GitHub Releases](https://github.com/Hermit-Avon/Whyrun/releases), then verify and
+install it:
+
+```bash
+sha256sum -c whyrun-vX.Y.Z-linux-x86_64.tar.gz.sha256
+tar -xzf whyrun-vX.Y.Z-linux-x86_64.tar.gz
+sudo install -m 0755 whyrun-vX.Y.Z-linux-x86_64/whyrun /usr/local/bin/whyrun
+whyrun --version
+```
+
+Replace `vX.Y.Z` with the downloaded release version. The release binary targets
+Ubuntu 22.04-compatible Linux x86_64 systems.
+
+### Build from source
+
+On Ubuntu 22.04 or newer, install a C++20 compiler, CMake, and SQLite development
 headers:
 
 ```bash
+sudo apt-get update
 sudo apt-get install build-essential cmake libsqlite3-dev
+```
+
+Build and install WhyRun:
+
+```bash
 cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
-cmake --build build -j
+cmake --build build --parallel
+sudo cmake --install build
+whyrun --version
 ```
 
-The executable is `build/whyrun`. Tests can be run with:
+Root access is normally needed only for installation. Recording usually works
+as an unprivileged user because WhyRun traces processes that it starts itself.
+Hardened ptrace policies, seccomp profiles, or container runtimes may require
+additional permissions.
+
+## Quick Start
+
+### Record a command
+
+Use `--` to separate WhyRun arguments from the command being recorded:
 
 ```bash
-ctest --test-dir build --output-on-failure
+whyrun record -- sh -c 'cat /etc/hosts > /tmp/hosts-copy'
 ```
 
-The kernel must permit a process to trace its own children. This normally works
-without root. Hardened ptrace policies, seccomp profiles, and some container
-runtimes may require adjusted permissions or `sudo`.
+WhyRun writes a timestamped capsule such as
+`run-20260809-185501.wrun` in the current directory.
 
-## Release
+### Inspect a capsule
 
-Pushing a version tag matching `v*` runs the release workflow. It builds and
-tests WhyRun on Ubuntu 22.04, verifies that the tag matches `whyrun --version`,
-and publishes a GitHub Release with a Linux x86_64 tarball and SHA-256 checksum.
-
-The workflow must be committed before creating the tag:
+Show a semantic summary:
 
 ```bash
-git tag -a v0.1.0 -m "WhyRun v0.1.0"
-git push origin main
-git push origin v0.1.0
+whyrun show run-20260809-185501.wrun
 ```
 
-## Usage
-
-List the available commands, show command-specific help, or print the version:
+Include the ordered event timeline:
 
 ```bash
-./build/whyrun help
-./build/whyrun help record
-./build/whyrun version
+whyrun show run-20260809-185501.wrun --events
 ```
 
-The conventional `--help`, `-h`, and `--version` flags are also supported.
-Each operational command accepts `--help`, for example
-`./build/whyrun show --help`.
+A summary includes the command and exit status, process count, file reads and
+writes, network endpoints, local IPC, and failed operations.
 
-Record an interactive Bash session:
+### Record an interactive session
+
+Start a clean Bash session under WhyRun:
 
 ```bash
-./build/whyrun record
+whyrun record
 ```
 
 Run commands normally, then use `exit` or `Ctrl-D` to finish and publish the
-capsule. WhyRun records each shell command with its working directory, exit
-status, process lineage, and semantic OS activity. A background process keeps
-the identity of the command that launched it, even after Bash displays the next
-prompt.
-
-Record one command instead:
+capsule. The session summary assigns a number to each command. Use that number
+to inspect only one command and its descendants:
 
 ```bash
-./build/whyrun record -- cat /etc/hosts
+whyrun show session.wrun --command 2
+whyrun show session.wrun --command 2 --events
 ```
 
-The command creates a timestamped SQLite capsule such as
-`run-20260809-185501.wrun` in the current directory.
+Background processes remain attributed to the command that launched them.
 
-Show its semantic summary or timeline:
+### Compare two runs
 
 ```bash
-./build/whyrun show run-20260809-185501.wrun
-./build/whyrun show run-20260809-185501.wrun --events
+whyrun diff successful.wrun failed.wrun
 ```
 
-For an interactive session, select one command by the number shown in the
-summary. This filters files, network endpoints, local IPC, errors, processes,
-and the optional timeline to that command's process tree:
+The diff focuses on behavioral changes rather than raw event-by-event noise.
+
+### Get help
 
 ```bash
-./build/whyrun show run-20260809-185501.wrun --command 2
-./build/whyrun show run-20260809-185501.wrun --command 2 --events
+whyrun help
+whyrun help record
+whyrun help show
+whyrun help diff
 ```
 
-One-shot recordings also have an implicit command `1`, so the same query works
-for both recording modes.
+The conventional `--help`, `-h`, and `--version` flags are also supported.
 
-Compare two executions:
-
-```bash
-./build/whyrun diff before.wrun after.wrun
-```
-
-`record` returns the traced command or session shell's exit code after
-successfully finalizing the capsule. Collector failures return a WhyRun error
-instead.
-
-## Example
+## Example Output
 
 ```text
-$ ./build/whyrun record -- sh -c 'cat /etc/hosts >/tmp/out'
-
-Capsule
-  run-20260809-185501.wrun
-
-$ ./build/whyrun show run-20260809-185501.wrun
+$ whyrun show run-20260809-185501.wrun
 Command
-  sh -c 'cat /etc/hosts >/tmp/out'
+  sh -c 'cat /etc/hosts > /tmp/hosts-copy'
 
 Exit
   code 0
@@ -130,81 +175,25 @@ Files
     /etc/hosts (2 calls, 187 bytes)
 
   WRITE
-    /tmp/out (1 calls, 187 bytes)
+    /tmp/hosts-copy (1 calls, 187 bytes)
 ```
-
-## Architecture
-
-```text
-PtraceCollector
-  -> per-TID raw syscall entry/exit state
-  -> ExecutionState normalization and FD/process correlation
-  -> semantic Event / EventSink
-  -> CapsuleWriter
-  -> SQLite .wrun capsule
-
-BashSession
-  -> in-band command arm/start/end markers
-  -> PtraceCollector control-FD correlation
-  -> ExecutionState command/process lineage
-
-semantic Event + command_id
-  -> CapsuleWriter commands/events tables
-
-SQLite capsule -> show summary / event timeline
-two capsules   -> aggregate diff
-```
-
-The SQLite database is built in the system temporary directory and published
-under its final `.wrun` name only after collection finishes. This prevents the
-recorded command from observing WhyRun's capsule or rollback journal in its
-working directory.
-
-`Collector` is an abstract interface. The CLI constructs the current
-`PtraceCollector`, but storage and comparison code never depend on ptrace.
-
-The collector follows fork, vfork, clone, exec, and exit ptrace events across
-the process tree. Every traced TID has independent syscall entry/exit state.
-`ExecutionState` correlates successful open and socket results with later
-read, write, close, dup, and connect calls. Child processes inherit a snapshot
-of the parent's FD table and cwd.
-
-Each newly recorded `.wrun` file is a self-contained SQLite database with schema
-version `3`; `show` and `diff` also accept version `1` and `2` capsules. It
-contains run and process records, command boundaries, semantic events with an
-optional command ID, and aggregate file and network activity. Negative Linux
-syscall results are stored alongside their positive errno value. Per-command
-views require a version `3` capsule.
 
 ## Current Limitations
 
-- Linux x86_64 syscall ABI only.
-- Interactive sessions currently use a clean `/bin/bash` launched with
-  `--noprofile --norc`; user startup files and other shells are not yet supported.
-- One interactive input line is one command unit. Pipelines, compound commands,
-  and commands separated on the same line are intentionally grouped together.
-- Session command boundaries are reported by Bash over an internal descriptor.
-  Ptrace captures those markers in syscall order and remains the source of truth
-  for observed processes, files, network activity, and errors. Shell startup
-  activity before the first prompt is intentionally not assigned to a command.
-- The v0.1 collector uses ptrace and has its runtime overhead and permission
-  constraints.
-- FD tables are copied at fork/clone time; `CLONE_FILES` sharing is not modeled.
-- File access through `mmap`, memory-mapped I/O, `sendfile`, and io_uring is not
-  tracked.
-- Relative `openat` paths need a known directory FD opened with `O_DIRECTORY`;
-  otherwise the capsule keeps an explicit `<dirfd:N>/...` unresolved path.
-- Network collection covers `socket` plus IPv4/IPv6 `connect`. Unix-domain
-  connects are decoded separately as local IPC. WhyRun does not do DNS
-  correlation, packet capture, TLS inspection, or socket namespace mapping.
-- Namespace and container path translation is not complete.
-- A process that changes working directory through covered `chdir` or `fchdir`
-  calls is tracked, but mount namespace changes are not interpreted.
+- Linux x86_64 is the only supported platform and syscall ABI.
+- Recording uses `ptrace`, which adds runtime overhead and may be restricted by
+  hardened systems or containers.
+- Interactive mode launches `/bin/bash --noprofile --norc`; other shells and
+  user startup files are not currently supported.
+- One interactive input line is treated as one command unit. Pipelines and
+  compound commands on that line are grouped together.
+- File access through `mmap`, `sendfile`, io_uring, and other uncovered paths is
+  not recorded.
+- Network recording covers connection metadata, not DNS correlation, packet
+  capture, or encrypted payload inspection.
+- Container, mount namespace, and unusual directory-FD path translation may be
+  incomplete.
 
-## Roadmap
+## License
 
-- Add more semantic syscall coverage while preserving the event model.
-- Model shared file descriptor tables and richer thread/process identity.
-- Add an optional eBPF collector behind the existing `Collector` interface.
-- Extend capsule compatibility and diff policies without requiring external
-  databases or services.
+WhyRun is licensed under the terms in [LICENSE](LICENSE).
