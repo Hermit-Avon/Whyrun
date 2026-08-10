@@ -85,17 +85,18 @@ private:
     sqlite3_stmt* statement_{};
 };
 
-inline void validate_schema(sqlite3* database) {
+inline int validate_schema(sqlite3* database) {
     ReadStatement statement(database,
                             "SELECT value FROM metadata WHERE key='schema_version'");
     if (!statement.next()) {
         throw std::runtime_error("not a WhyRun capsule: schema_version is missing");
     }
-    if (statement.text(0) != "1") {
+    const std::string version = statement.text(0);
+    if (version != "1" && version != "2") {
         throw std::runtime_error("unsupported WhyRun capsule schema version " +
-                                 statement.text(0));
+                                 version);
     }
+    return version == "1" ? 1 : 2;
 }
 
 }  // namespace whyrun::detail
-

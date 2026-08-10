@@ -168,10 +168,10 @@ bool resume_syscall(pid_t tid, int signal, std::string& error) {
 
 class PtraceCollector final : public Collector {
 public:
-    CollectionResult collect(const std::vector<std::string>& command,
+    CollectionResult collect(const CollectionRequest& request,
                              EventSink& sink) override {
         CollectionResult result;
-        if (command.empty()) {
+        if (request.command.empty()) {
             result.error = "record requires a command after --";
             return result;
         }
@@ -191,14 +191,23 @@ public:
                 _exit(126);
             }
 
+            for (const auto& [name, value] : request.environment) {
+                if (setenv(name.c_str(), value.c_str(), 1) == -1) {
+                    const std::string message = "whyrun: setenv " + name + ": " +
+                                                std::strerror(errno) + "\n";
+                    static_cast<void>(write(STDERR_FILENO, message.data(), message.size()));
+                    _exit(126);
+                }
+            }
+
             std::vector<char*> argv;
-            argv.reserve(command.size() + 1);
-            for (const auto& argument : command) {
+            argv.reserve(request.command.size() + 1);
+            for (const auto& argument : request.command) {
                 argv.push_back(const_cast<char*>(argument.c_str()));
             }
             argv.push_back(nullptr);
             execvp(argv.front(), argv.data());
-            const std::string message = "whyrun: execvp " + command.front() + ": " +
+            const std::string message = "whyrun: execvp " + request.command.front() + ": " +
                                         std::strerror(errno) + "\n";
             static_cast<void>(write(STDERR_FILENO, message.data(), message.size()));
             _exit(127);

@@ -1,6 +1,7 @@
 #pragma once
 
 #include "whyrun/collector.hpp"
+#include "whyrun/session.hpp"
 
 #include <cstdint>
 #include <filesystem>
@@ -11,8 +12,16 @@
 
 namespace whyrun {
 
+enum class RunMode {
+    Command,
+    Session,
+};
+
+std::string_view run_mode_name(RunMode mode);
+
 struct RunMetadata {
     std::string id;
+    RunMode mode{RunMode::Command};
     std::vector<std::string> command;
     std::string cwd;
     std::uint64_t start_ns{};
@@ -29,6 +38,7 @@ public:
     CapsuleWriter& operator=(CapsuleWriter&&) noexcept;
 
     void emit(const Event& event) override;
+    void add_command(const RecordedCommand& command);
     void finish(const CollectionResult& result);
 
 private:

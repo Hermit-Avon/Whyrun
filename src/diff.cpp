@@ -22,16 +22,18 @@ struct Counts {
 
 struct Summary {
     std::int64_t exit_code{};
+    bool session{};
     std::map<std::string, Counts> reads;
     std::map<std::string, Counts> writes;
     std::map<std::string, Counts> network;
     std::map<std::string, Counts> local_ipc;
     std::set<std::string> executables;
+    std::set<std::string> commands;
 };
 
 Summary load_summary(const std::filesystem::path& path) {
     detail::ReadDatabase database(path);
-    detail::validate_schema(database.get());
+    const int schema_version = detail::validate_schema(database.get());
     Summary summary;
 
     detail::ReadStatement run(database.get(), "SELECT exit_code FROM runs LIMIT 1");
@@ -39,6 +41,20 @@ Summary load_summary(const std::filesystem::path& path) {
         throw std::runtime_error("capsule does not contain a run: " + path.string());
     }
     summary.exit_code = run.integer(0);
+
+    if (schema_version >= 2) {
+        detail::ReadStatement mode(database.get(), "SELECT mode FROM runs LIMIT 1");
+        if (mode.next()) {
+            summary.session = mode.text(0) == "session";
+        }
+        if (summary.session) {
+            detail::ReadStatement commands(
+                database.get(), "SELECT DISTINCT command FROM commands ORDER BY command");
+            while (commands.next()) {
+                summary.commands.insert(commands.text(0));
+            }
+        }
+    }
 
     detail::ReadStatement files(
         database.get(),
@@ -153,6 +169,14 @@ int diff_capsules(const std::filesystem::path& before,
             std::cout << "- " << a.exit_code << "\n+ " << b.exit_code << '\n';
         }
         std::cout << '\n';
+
+        if (a.session || b.session) {
+            std::cout << "Commands\n";
+            if (!print_set_diff(a.commands, b.commands)) {
+                std::cout << "  none\n";
+            }
+            std::cout << '\n';
+        }
 
         std::cout << "Files\n";
         bool file_changes = print_activity_diff("READ ", a.reads, b.reads);

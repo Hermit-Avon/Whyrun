@@ -55,6 +55,21 @@ grep -q "^+ unix:$unix_path" unix.diff
 "$whyrun" diff "$true_capsule" "$file_capsule" > result.diff
 grep -q '^+ WRITE ' result.diff
 
+printf "cat '%s'\nfalse\necho \$?\nexit 0\n" "$work/input.txt" > session.input
+"$whyrun" record < session.input > session.log 2> session.stderr
+session_capsule=$(ls -1t run-*.wrun | head -1)
+"$whyrun" show "$session_capsule" --events > session.show
+grep -q '^Session$' session.show
+grep -Fq "cat '$work/input.txt' (exit 0)" session.show
+grep -Fq 'false (exit 1)' session.show
+grep -Fq 'echo $? (exit 0)' session.show
+grep -q "$work/input.txt" session.show
+fork_count=$(grep -c ' process_fork ' session.show)
+[ "$fork_count" -eq 1 ]
+"$whyrun" diff "$true_capsule" "$session_capsule" > session.diff
+grep -q '^Commands$' session.diff
+grep -Fq "+ cat '$work/input.txt'" session.diff
+
 visibility="$work/visibility"
 mkdir -p "$visibility"
 cd "$visibility"

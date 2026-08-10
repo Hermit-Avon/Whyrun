@@ -207,12 +207,22 @@ public:
             );
             CREATE TABLE runs (
                 id TEXT PRIMARY KEY,
+                mode TEXT NOT NULL CHECK(mode IN ('command', 'session')),
                 command TEXT NOT NULL,
                 cwd TEXT,
                 start_ns INTEGER,
                 end_ns INTEGER,
                 exit_code INTEGER,
                 term_signal INTEGER
+            );
+            CREATE TABLE commands (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                sequence INTEGER NOT NULL UNIQUE,
+                completed_ns INTEGER NOT NULL,
+                shell_pid INTEGER NOT NULL,
+                command TEXT NOT NULL,
+                completed_cwd TEXT,
+                exit_code INTEGER NOT NULL
             );
             CREATE TABLE processes (
                 pid INTEGER PRIMARY KEY,
@@ -250,12 +260,13 @@ public:
             );
             CREATE INDEX events_by_time ON events(timestamp_ns, id);
             CREATE INDEX events_by_errno ON events(errno_value);
+            CREATE INDEX commands_by_time ON commands(completed_ns, sequence);
         )sql");
         database_.execute("BEGIN IMMEDIATE;");
 
         {
             Statement statement(database_.get(),
-                                "INSERT INTO metadata(key, value) VALUES('schema_version', '1')");
+                                "INSERT INTO metadata(key, value) VALUES('schema_version', '2')");
             statement.execute();
         }
         {
@@ -266,11 +277,13 @@ public:
         }
         {
             Statement statement(database_.get(),
-                                "INSERT INTO runs(id, command, cwd, start_ns) VALUES(?, ?, ?, ?)");
+                                "INSERT INTO runs(id, mode, command, cwd, start_ns) "
+                                "VALUES(?, ?, ?, ?, ?)");
             statement.bind(1, run.id);
-            statement.bind(2, format_command(run.command));
-            statement.bind(3, run.cwd);
-            statement.bind(4, as_i64(run.start_ns));
+            statement.bind(2, run_mode_name(run.mode));
+            statement.bind(3, format_command(run.command));
+            statement.bind(4, run.cwd);
+            statement.bind(5, as_i64(run.start_ns));
             statement.execute();
         }
     }
@@ -367,6 +380,20 @@ public:
         }
     }
 
+    void add_command(const RecordedCommand& command) {
+        Statement statement(
+            database_.get(),
+            "INSERT INTO commands(sequence, completed_ns, shell_pid, command, "
+            "completed_cwd, exit_code) VALUES(?, ?, ?, ?, ?, ?)");
+        statement.bind(1, as_i64(command.sequence));
+        statement.bind(2, as_i64(command.completed_ns));
+        statement.bind(3, static_cast<std::int64_t>(command.shell_pid));
+        statement.bind(4, command.text);
+        statement.bind(5, command.completed_cwd);
+        statement.bind(6, static_cast<std::int64_t>(command.exit_code));
+        statement.execute();
+    }
+
     void finish(const CollectionResult& result) {
         if (finished_) {
             throw std::logic_error("capsule has already been finalized");
@@ -395,6 +422,10 @@ CapsuleWriter& CapsuleWriter::operator=(CapsuleWriter&&) noexcept = default;
 
 void CapsuleWriter::emit(const Event& event) {
     impl_->emit(event);
+}
+
+void CapsuleWriter::add_command(const RecordedCommand& command) {
+    impl_->add_command(command);
 }
 
 void CapsuleWriter::finish(const CollectionResult& result) {
@@ -468,6 +499,16 @@ std::string format_command(const std::vector<std::string>& command) {
         output << shell_quote(command[index]);
     }
     return output.str();
+}
+
+std::string_view run_mode_name(RunMode mode) {
+    switch (mode) {
+        case RunMode::Command:
+            return "command";
+        case RunMode::Session:
+            return "session";
+    }
+    throw std::logic_error("unknown run mode");
 }
 
 }  // namespace whyrun

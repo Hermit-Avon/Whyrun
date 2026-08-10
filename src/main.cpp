@@ -1,11 +1,13 @@
 #include "whyrun/collector.hpp"
 #include "whyrun/commands.hpp"
+#include "whyrun/session.hpp"
 #include "whyrun/store.hpp"
 #include "whyrun/version.hpp"
 
 #include <chrono>
 #include <filesystem>
 #include <iostream>
+#include <memory>
 #include <string>
 #include <string_view>
 #include <utility>
@@ -51,7 +53,7 @@ void print_general_help(std::ostream& output) {
               "Usage:\n"
               "  whyrun <command> [options]\n\n"
               "Commands:\n"
-              "  record   Record a command into an execution capsule\n"
+              "  record   Record a command or interactive Bash session\n"
               "  show     Show a capsule summary or semantic event timeline\n"
               "  diff     Compare two execution capsules\n"
               "  help     Show general or command-specific help\n"
@@ -68,8 +70,10 @@ bool print_command_help(std::string_view command, std::ostream& output) {
     output << "WhyRun " << whyrun::kVersion << "\n\n";
     if (command == "record") {
         output << "Usage:\n"
+                  "  whyrun record\n"
                   "  whyrun record -- <command> [args...]\n\n"
-                  "Record a command and its process tree into a .wrun capsule.\n";
+                  "Without a command, record an interactive Bash session.\n"
+                  "With --, record one command and its process tree.\n";
         return true;
     }
     if (command == "show") {
@@ -114,32 +118,56 @@ int help_command(int argc, char** argv) {
 }
 
 int record_command(int argc, char** argv) {
-    if (argc < 4 || std::string_view(argv[2]) != "--") {
-        std::cerr << "whyrun record: expected -- followed by a command\n";
+    const bool session_mode = argc == 2;
+    if (!session_mode && (argc < 4 || std::string_view(argv[2]) != "--")) {
+        std::cerr << "whyrun record: expected no arguments or -- followed by a command\n";
         std::cerr << "Try 'whyrun help record'.\n";
         return 2;
     }
 
-    std::vector<std::string> command;
-    for (int index = 3; index < argc; ++index) {
-        command.emplace_back(argv[index]);
-    }
-
-    const auto capsule_path = whyrun::default_capsule_path();
-    const auto start = now_ns();
-    std::error_code cwd_error;
-    const auto cwd = std::filesystem::current_path(cwd_error);
-    whyrun::RunMetadata metadata{capsule_path.stem().string(), command,
-                                 cwd_error ? std::string{} : cwd.string(), start};
-
     try {
+        whyrun::CollectionRequest request;
+        std::unique_ptr<whyrun::BashSession> session;
+        if (session_mode) {
+            session = std::make_unique<whyrun::BashSession>();
+            request = session->request();
+        } else {
+            for (int index = 3; index < argc; ++index) {
+                request.command.emplace_back(argv[index]);
+            }
+        }
+
+        const auto capsule_path = whyrun::default_capsule_path();
+        std::error_code cwd_error;
+        const auto cwd = std::filesystem::current_path(cwd_error);
+        whyrun::RunMetadata metadata;
+        metadata.id = capsule_path.stem().string();
+        metadata.mode = session_mode ? whyrun::RunMode::Session
+                                     : whyrun::RunMode::Command;
+        metadata.command = session_mode ? std::vector<std::string>{"/bin/bash"}
+                                        : request.command;
+        metadata.cwd = cwd_error ? std::string{} : cwd.string();
+        metadata.start_ns = now_ns();
+
+        if (session_mode) {
+            std::cout << "WhyRun session\n"
+                         "  shell /bin/bash\n"
+                         "  use exit or Ctrl-D to finish\n\n"
+                      << std::flush;
+        }
+
         const auto temporary_path = whyrun::temporary_capsule_path(metadata.id);
         TemporaryCapsuleGuard temporary_guard(temporary_path);
         whyrun::CollectionResult result;
         {
             whyrun::CapsuleWriter writer(temporary_path, metadata);
             auto collector = whyrun::make_ptrace_collector();
-            result = collector->collect(command, writer);
+            result = collector->collect(request, writer);
+            if (session) {
+                for (const auto& command : session->read_commands()) {
+                    writer.add_command(command);
+                }
+            }
             writer.finish(result);
         }
         whyrun::publish_capsule(temporary_path, capsule_path);

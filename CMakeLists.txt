@@ -25,6 +25,7 @@ set(CMAKE_CXX_EXTENSIONS OFF)
 find_package(SQLite3 REQUIRED)
 
 add_library(whyrun_core
+    src/bash_session.cpp
     src/event.cpp
     src/execution_state.cpp
     src/ptrace_collector.cpp

@@ -5,6 +5,7 @@
 #include <cstdint>
 #include <memory>
 #include <string>
+#include <utility>
 #include <vector>
 
 namespace whyrun {
@@ -17,16 +18,20 @@ struct CollectionResult {
     std::string error;
 };
 
+struct CollectionRequest {
+    std::vector<std::string> command;
+    std::vector<std::pair<std::string, std::string>> environment;
+};
+
 class Collector {
 public:
     virtual ~Collector() = default;
 
     virtual CollectionResult collect(
-        const std::vector<std::string>& command,
+        const CollectionRequest& request,
         EventSink& sink) = 0;
 };
 
 std::unique_ptr<Collector> make_ptrace_collector();
 
 }  // namespace whyrun
-

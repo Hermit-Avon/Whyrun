@@ -150,6 +150,31 @@ void show_errors(sqlite3* database) {
     std::cout << '\n';
 }
 
+void show_commands(sqlite3* database) {
+    std::cout << "Commands\n";
+    detail::ReadStatement statement(
+        database,
+        "SELECT sequence, command, exit_code FROM commands ORDER BY sequence");
+    bool any = false;
+    while (statement.next()) {
+        any = true;
+        std::cout << "  " << statement.integer(0) << "  ";
+        const std::string command = statement.text(1);
+        for (const char character : command) {
+            if (character == '\n') {
+                std::cout << "\n     ";
+            } else {
+                std::cout << character;
+            }
+        }
+        std::cout << " (exit " << statement.integer(2) << ")\n";
+    }
+    if (!any) {
+        std::cout << "  none\n";
+    }
+    std::cout << '\n';
+}
+
 void show_timeline(sqlite3* database, std::int64_t start_ns) {
     std::cout << "Events\n";
     detail::ReadStatement statement(
@@ -178,25 +203,38 @@ void show_timeline(sqlite3* database, std::int64_t start_ns) {
 int show_capsule(const std::filesystem::path& path, bool show_events) {
     try {
         detail::ReadDatabase database(path);
-        detail::validate_schema(database.get());
+        const int schema_version = detail::validate_schema(database.get());
 
         detail::ReadStatement run(
             database.get(),
-            "SELECT command, exit_code, term_signal, start_ns FROM runs LIMIT 1");
+            schema_version >= 2
+                ? "SELECT mode, command, exit_code, term_signal, start_ns "
+                  "FROM runs LIMIT 1"
+                : "SELECT 'command', command, exit_code, term_signal, start_ns "
+                  "FROM runs LIMIT 1");
         if (!run.next()) {
             throw std::runtime_error("capsule does not contain a run");
         }
-        const std::string command = run.text(0);
-        const auto exit_code = run.integer(1);
-        const auto term_signal = run.integer(2);
-        const auto start_ns = run.integer(3);
+        const std::string mode = run.text(0);
+        const std::string command = run.text(1);
+        const auto exit_code = run.integer(2);
+        const auto term_signal = run.integer(3);
+        const auto start_ns = run.integer(4);
 
-        std::cout << "Command\n  " << command << "\n\n";
+        if (mode == "session") {
+            std::cout << "Session\n  shell " << command << "\n\n";
+        } else {
+            std::cout << "Command\n  " << command << "\n\n";
+        }
         std::cout << "Exit\n  code " << exit_code;
         if (term_signal != 0) {
             std::cout << " (signal " << term_signal << ')';
         }
         std::cout << "\n\n";
+
+        if (mode == "session") {
+            show_commands(database.get());
+        }
 
         detail::ReadStatement processes(database.get(), "SELECT COUNT(*) FROM processes");
         processes.next();

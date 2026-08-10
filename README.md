@@ -1,8 +1,8 @@
 # WhyRun
 
 WhyRun records what a Linux process actually did, normalizes low-level kernel
-activity into semantic execution events, and stores one execution as a portable
-capsule that can be inspected or compared with another run.
+activity into semantic execution events, and stores a command or interactive
+session as a portable capsule that can be inspected or compared with another run.
 
 WhyRun v0.1 is a working x86_64 Linux prototype. It uses `ptrace` as its
 collector backend and SQLite as its capsule format. Future versions may add an
@@ -57,7 +57,18 @@ The conventional `--help`, `-h`, and `--version` flags are also supported.
 Each operational command accepts `--help`, for example
 `./build/whyrun show --help`.
 
-Record a command:
+Record an interactive Bash session:
+
+```bash
+./build/whyrun record
+```
+
+Run commands normally, then use `exit` or `Ctrl-D` to finish and publish the
+capsule. WhyRun records each completed shell command with its completion-time
+working directory and exit code while ptrace independently records the process
+tree and semantic OS activity.
+
+Record one command instead:
 
 ```bash
 ./build/whyrun record -- cat /etc/hosts
@@ -79,8 +90,9 @@ Compare two executions:
 ./build/whyrun diff before.wrun after.wrun
 ```
 
-`record` returns the traced command's exit code after successfully finalizing
-the capsule. Collector failures return a WhyRun error instead.
+`record` returns the traced command or session shell's exit code after
+successfully finalizing the capsule. Collector failures return a WhyRun error
+instead.
 
 ## Example
 
@@ -118,6 +130,10 @@ PtraceCollector
   -> CapsuleWriter
   -> SQLite .wrun capsule
 
+BashSession
+  -> shell command / cwd / exit status context
+  -> CapsuleWriter commands table
+
 SQLite capsule -> show summary / event timeline
 two capsules   -> aggregate diff
 ```
@@ -136,14 +152,19 @@ the process tree. Every traced TID has independent syscall entry/exit state.
 read, write, close, dup, and connect calls. Child processes inherit a snapshot
 of the parent's FD table and cwd.
 
-Each `.wrun` file is a self-contained SQLite database with schema version `1`.
-It contains run and process records, semantic events, aggregated file activity,
-and aggregated network activity. Negative Linux syscall results are stored
-alongside their positive errno value.
+Each newly recorded `.wrun` file is a self-contained SQLite database with schema
+version `2`; `show` and `diff` also accept version `1` capsules. It contains run,
+process, and optional shell command records, semantic events, aggregated file
+activity, and aggregated network activity. Negative Linux syscall results are
+stored alongside their positive errno value.
 
 ## Current Limitations
 
 - Linux x86_64 syscall ABI only.
+- Interactive sessions currently use a clean `/bin/bash` launched with
+  `--noprofile --norc`; user startup files and other shells are not yet supported.
+- Session command context is reported by Bash. Ptrace remains the source of
+  truth for observed processes, files, network activity, and errors.
 - The v0.1 collector uses ptrace and has its runtime overhead and permission
   constraints.
 - FD tables are copied at fork/clone time; `CLONE_FILES` sharing is not modeled.
