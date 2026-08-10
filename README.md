@@ -45,6 +45,18 @@ git push origin v0.1.0
 
 ## Usage
 
+List the available commands, show command-specific help, or print the version:
+
+```bash
+./build/whyrun help
+./build/whyrun help record
+./build/whyrun version
+```
+
+The conventional `--help`, `-h`, and `--version` flags are also supported.
+Each operational command accepts `--help`, for example
+`./build/whyrun show --help`.
+
 Record a command:
 
 ```bash

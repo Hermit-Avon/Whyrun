@@ -1,6 +1,7 @@
 #include "whyrun/store.hpp"
 
 #include "whyrun/event.hpp"
+#include "whyrun/version.hpp"
 
 #include <sqlite3.h>
 #include <unistd.h>
@@ -259,7 +260,8 @@ public:
         }
         {
             Statement statement(database_.get(),
-                                "INSERT INTO metadata(key, value) VALUES('tool_version', '0.1.0')");
+                                "INSERT INTO metadata(key, value) VALUES('tool_version', ?)");
+            statement.bind(1, kVersion);
             statement.execute();
         }
         {
