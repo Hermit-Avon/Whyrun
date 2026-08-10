@@ -3,14 +3,18 @@
 #include "capsule_reader.hpp"
 
 #include <cerrno>
-#include <cstring>
+#include <cstdint>
 #include <iomanip>
 #include <iostream>
-#include <sstream>
+#include <optional>
+#include <stdexcept>
 #include <string>
+#include <string_view>
 
 namespace whyrun {
 namespace {
+
+using CommandFilter = std::optional<std::int64_t>;
 
 std::string errno_name(int value) {
     switch (value) {
@@ -51,16 +55,46 @@ std::string errno_name(int value) {
     }
 }
 
-void show_files(sqlite3* database) {
+std::string command_clause(CommandFilter command_id,
+                           std::string_view table_prefix = {}) {
+    if (!command_id.has_value()) {
+        return {};
+    }
+    return " AND " + std::string(table_prefix) + "command_id=" +
+           std::to_string(*command_id);
+}
+
+void print_command_text(std::string_view command, std::string_view indent) {
+    for (const char character : command) {
+        if (character == '\n') {
+            std::cout << '\n' << indent;
+        } else {
+            std::cout << character;
+        }
+    }
+}
+
+void show_files(sqlite3* database, CommandFilter command_id) {
     std::cout << "Files\n";
     for (const auto* mode : {"READ", "WRITE"}) {
         std::cout << "  " << mode << "\n";
         const bool read = std::string_view(mode) == "READ";
-        const std::string sql =
-            std::string("SELECT path, ") + (read ? "read_calls, bytes_read" :
-                                                   "write_calls, bytes_written") +
-            " FROM file_activity WHERE " + (read ? "read_calls" : "write_calls") +
-            ">0 ORDER BY path";
+        std::string sql;
+        if (command_id.has_value()) {
+            sql = "SELECT resource, COUNT(*), "
+                  "COALESCE(SUM(CASE WHEN result>0 THEN result ELSE 0 END), 0) "
+                  "FROM events WHERE type='" +
+                  std::string(read ? "file_read" : "file_write") + "'" +
+                  command_clause(command_id) +
+                  " GROUP BY resource ORDER BY resource";
+        } else {
+            sql = std::string("SELECT path, ") +
+                  (read ? "read_calls, bytes_read" :
+                          "write_calls, bytes_written") +
+                  " FROM file_activity WHERE " +
+                  (read ? "read_calls" : "write_calls") + ">0 ORDER BY path";
+        }
+
         detail::ReadStatement statement(database, sql);
         bool any = false;
         while (statement.next()) {
@@ -75,12 +109,27 @@ void show_files(sqlite3* database) {
     }
 }
 
-void show_network(sqlite3* database) {
+void show_network(sqlite3* database, CommandFilter command_id) {
     std::cout << "Network\n";
-    detail::ReadStatement statement(
-        database,
-        "SELECT endpoint, connect_count, success_count, failure_count, last_errno "
-        "FROM network_activity ORDER BY endpoint");
+    std::string sql;
+    if (command_id.has_value()) {
+        const std::string id = std::to_string(*command_id);
+        sql = "SELECT e.resource, COUNT(*), "
+              "SUM(CASE WHEN e.errno_value=0 THEN 1 ELSE 0 END), "
+              "SUM(CASE WHEN e.errno_value>0 THEN 1 ELSE 0 END), "
+              "COALESCE((SELECT e2.errno_value FROM events e2 "
+              "WHERE e2.type='network_connect' AND e2.command_id=" +
+              id +
+              " AND e2.resource=e.resource ORDER BY e2.timestamp_ns DESC, e2.id DESC "
+              "LIMIT 1), 0) FROM events e WHERE e.type='network_connect' "
+              "AND e.command_id=" +
+              id + " GROUP BY e.resource ORDER BY e.resource";
+    } else {
+        sql = "SELECT endpoint, connect_count, success_count, failure_count, "
+              "last_errno FROM network_activity ORDER BY endpoint";
+    }
+
+    detail::ReadStatement statement(database, sql);
     bool any = false;
     while (statement.next()) {
         any = true;
@@ -88,7 +137,8 @@ void show_network(sqlite3* database) {
                   << " attempts, " << statement.integer(2) << " succeeded, "
                   << statement.integer(3) << " failed";
         if (statement.integer(4) != 0) {
-            std::cout << ", last " << errno_name(static_cast<int>(statement.integer(4)));
+            std::cout << ", last "
+                      << errno_name(static_cast<int>(statement.integer(4)));
         }
         std::cout << ")\n";
     }
@@ -98,15 +148,15 @@ void show_network(sqlite3* database) {
     std::cout << '\n';
 }
 
-void show_local_ipc(sqlite3* database) {
+void show_local_ipc(sqlite3* database, CommandFilter command_id) {
     std::cout << "Local IPC\n";
-    detail::ReadStatement statement(
-        database,
+    const std::string sql =
         "SELECT resource, COUNT(*), "
         "SUM(CASE WHEN errno_value=0 THEN 1 ELSE 0 END), "
         "SUM(CASE WHEN errno_value>0 THEN 1 ELSE 0 END) "
-        "FROM events WHERE type='local_ipc_connect' "
-        "GROUP BY resource ORDER BY resource");
+        "FROM events WHERE type='local_ipc_connect'" +
+        command_clause(command_id) + " GROUP BY resource ORDER BY resource";
+    detail::ReadStatement statement(database, sql);
     bool any = false;
     while (statement.next()) {
         any = true;
@@ -120,12 +170,15 @@ void show_local_ipc(sqlite3* database) {
     std::cout << '\n';
 }
 
-void show_errors(sqlite3* database) {
+void show_errors(sqlite3* database, CommandFilter command_id) {
     std::cout << "Errors\n";
-    detail::ReadStatement statement(
-        database,
-        "SELECT resource, type, errno_value, COUNT(*) FROM events WHERE errno_value>0 "
-        "GROUP BY resource, type, errno_value ORDER BY resource, type, errno_value");
+    const std::string sql =
+        "SELECT resource, type, errno_value, COUNT(*) FROM events "
+        "WHERE errno_value>0" +
+        command_clause(command_id) +
+        " GROUP BY resource, type, errno_value "
+        "ORDER BY resource, type, errno_value";
+    detail::ReadStatement statement(database, sql);
     bool any = false;
     while (statement.next()) {
         any = true;
@@ -159,15 +212,12 @@ void show_commands(sqlite3* database) {
     while (statement.next()) {
         any = true;
         std::cout << "  " << statement.integer(0) << "  ";
-        const std::string command = statement.text(1);
-        for (const char character : command) {
-            if (character == '\n') {
-                std::cout << "\n     ";
-            } else {
-                std::cout << character;
-            }
+        print_command_text(statement.text(1), "     ");
+        if (statement.is_null(2)) {
+            std::cout << " (incomplete)\n";
+        } else {
+            std::cout << " (exit " << statement.integer(2) << ")\n";
         }
-        std::cout << " (exit " << statement.integer(2) << ")\n";
     }
     if (!any) {
         std::cout << "  none\n";
@@ -175,77 +225,121 @@ void show_commands(sqlite3* database) {
     std::cout << '\n';
 }
 
-void show_timeline(sqlite3* database, std::int64_t start_ns) {
-    std::cout << "Events\n";
+std::int64_t show_command_header(sqlite3* database, std::int64_t command_id) {
     detail::ReadStatement statement(
         database,
+        "SELECT sequence, command, cwd, start_ns, exit_code FROM commands WHERE id=" +
+            std::to_string(command_id));
+    if (!statement.next()) {
+        throw std::runtime_error("capsule does not contain command " +
+                                 std::to_string(command_id));
+    }
+
+    std::cout << "Command " << statement.integer(0) << "\n  ";
+    print_command_text(statement.text(1), "  ");
+    std::cout << "\n\nCwd\n  " << statement.text(2) << "\n\nExit\n  ";
+    if (statement.is_null(4)) {
+        std::cout << "incomplete\n\n";
+    } else {
+        std::cout << "code " << statement.integer(4) << "\n\n";
+    }
+    return statement.integer(3);
+}
+
+void show_processes(sqlite3* database, CommandFilter command_id) {
+    std::string sql = "SELECT COUNT(*) FROM processes";
+    if (command_id.has_value()) {
+        sql = "SELECT COUNT(DISTINCT pid) FROM events WHERE type='process_exec'" +
+              command_clause(command_id);
+    }
+    detail::ReadStatement processes(database, sql);
+    processes.next();
+    std::cout << "Processes\n  " << processes.integer(0) << "\n\n";
+}
+
+void show_timeline(sqlite3* database, std::int64_t start_ns,
+                   CommandFilter command_id) {
+    std::cout << "Events\n";
+    const std::string sql =
         "SELECT timestamp_ns, pid, tid, type, resource, result, errno_value "
-        "FROM events ORDER BY timestamp_ns, id");
+        "FROM events WHERE 1=1" +
+        command_clause(command_id) +
+        " ORDER BY timestamp_ns, CASE type WHEN 'command_start' THEN 0 ELSE 1 END, id";
+    detail::ReadStatement statement(database, sql);
     while (statement.next()) {
         const double milliseconds =
             static_cast<double>(statement.integer(0) - start_ns) / 1'000'000.0;
         std::cout << "  +" << std::fixed << std::setprecision(3) << milliseconds
-                  << " ms pid=" << statement.integer(1) << " tid=" << statement.integer(2)
-                  << ' ' << statement.text(3);
+                  << " ms pid=" << statement.integer(1)
+                  << " tid=" << statement.integer(2) << ' ' << statement.text(3);
         if (!statement.text(4).empty()) {
             std::cout << ' ' << statement.text(4);
         }
         std::cout << " -> " << statement.integer(5);
         if (statement.integer(6) != 0) {
-            std::cout << " (" << errno_name(static_cast<int>(statement.integer(6))) << ')';
+            std::cout << " (" << errno_name(static_cast<int>(statement.integer(6)))
+                      << ')';
         }
         std::cout << '\n';
     }
 }
 
+std::int64_t show_run_header(sqlite3* database, int schema_version,
+                             std::string& mode) {
+    detail::ReadStatement run(
+        database,
+        schema_version >= 2
+            ? "SELECT mode, command, exit_code, term_signal, start_ns "
+              "FROM runs LIMIT 1"
+            : "SELECT 'command', command, exit_code, term_signal, start_ns "
+              "FROM runs LIMIT 1");
+    if (!run.next()) {
+        throw std::runtime_error("capsule does not contain a run");
+    }
+    mode = run.text(0);
+    if (mode == "session") {
+        std::cout << "Session\n  shell " << run.text(1) << "\n\n";
+    } else {
+        std::cout << "Command\n  " << run.text(1) << "\n\n";
+    }
+    std::cout << "Exit\n  code " << run.integer(2);
+    if (run.integer(3) != 0) {
+        std::cout << " (signal " << run.integer(3) << ')';
+    }
+    std::cout << "\n\n";
+    return run.integer(4);
+}
+
 }  // namespace
 
-int show_capsule(const std::filesystem::path& path, bool show_events) {
+int show_capsule(const std::filesystem::path& path, const ShowOptions& options) {
     try {
         detail::ReadDatabase database(path);
         const int schema_version = detail::validate_schema(database.get());
-
-        detail::ReadStatement run(
-            database.get(),
-            schema_version >= 2
-                ? "SELECT mode, command, exit_code, term_signal, start_ns "
-                  "FROM runs LIMIT 1"
-                : "SELECT 'command', command, exit_code, term_signal, start_ns "
-                  "FROM runs LIMIT 1");
-        if (!run.next()) {
-            throw std::runtime_error("capsule does not contain a run");
+        const CommandFilter command_id = options.command_id;
+        if (command_id.has_value() && schema_version < 3) {
+            throw std::runtime_error(
+                "capsule schema does not contain per-command attribution");
         }
-        const std::string mode = run.text(0);
-        const std::string command = run.text(1);
-        const auto exit_code = run.integer(2);
-        const auto term_signal = run.integer(3);
-        const auto start_ns = run.integer(4);
 
-        if (mode == "session") {
-            std::cout << "Session\n  shell " << command << "\n\n";
+        std::int64_t timeline_start{};
+        std::string mode;
+        if (command_id.has_value()) {
+            timeline_start = show_command_header(database.get(), *command_id);
         } else {
-            std::cout << "Command\n  " << command << "\n\n";
-        }
-        std::cout << "Exit\n  code " << exit_code;
-        if (term_signal != 0) {
-            std::cout << " (signal " << term_signal << ')';
-        }
-        std::cout << "\n\n";
-
-        if (mode == "session") {
-            show_commands(database.get());
+            timeline_start = show_run_header(database.get(), schema_version, mode);
+            if (mode == "session") {
+                show_commands(database.get());
+            }
         }
 
-        detail::ReadStatement processes(database.get(), "SELECT COUNT(*) FROM processes");
-        processes.next();
-        std::cout << "Processes\n  " << processes.integer(0) << "\n\n";
-
-        show_files(database.get());
-        show_network(database.get());
-        show_local_ipc(database.get());
-        show_errors(database.get());
-        if (show_events) {
-            show_timeline(database.get(), start_ns);
+        show_processes(database.get(), command_id);
+        show_files(database.get(), command_id);
+        show_network(database.get(), command_id);
+        show_local_ipc(database.get(), command_id);
+        show_errors(database.get(), command_id);
+        if (options.events) {
+            show_timeline(database.get(), timeline_start, command_id);
         }
         return 0;
     } catch (const std::exception& error) {

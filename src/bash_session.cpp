@@ -3,13 +3,9 @@
 #include <fcntl.h>
 #include <unistd.h>
 
-#include <array>
 #include <charconv>
 #include <cerrno>
 #include <cstdint>
-#include <cstdlib>
-#include <filesystem>
-#include <limits>
 #include <stdexcept>
 #include <string>
 #include <string_view>
@@ -20,28 +16,50 @@
 namespace whyrun {
 namespace {
 
-constexpr std::size_t kProtocolFields = 5;
-constexpr std::size_t kMaximumContextBytes = 64U * 1024U * 1024U;
+constexpr std::size_t kProtocolFields = 4;
+constexpr std::size_t kMaximumFieldBytes = 64U * 1024U;
 
-constexpr std::string_view kCaptureFunction = R"bash(() {
+constexpr std::string_view kStartFunction = R"bash(() {
     local command_status="$1"
-    local history_number=$((HISTCMD - 1))
-    if (( history_number > __whyrun_last_history )); then
-        builtin printf '%s\0%s\0%s\0%s\0' \
-            "$EPOCHREALTIME" "$BASHPID" "$command_status" "$PWD" \
-            >&"$WHYRUN_CONTEXT_FD"
+    if (( __whyrun_skip_debug > 0 )); then
+        __whyrun_skip_debug=$((__whyrun_skip_debug - 1))
+        return "$command_status"
+    fi
+    if (( __whyrun_at_prompt )); then
+        __whyrun_at_prompt=0
+        builtin printf 'S\0%s\0%s\0' \
+            "$__whyrun_active_command" "$PWD" >&"$WHYRUN_CONTEXT_FD"
         HISTTIMEFORMAT=$'\034' builtin history 1 >&"$WHYRUN_CONTEXT_FD"
         builtin printf '\0' >&"$WHYRUN_CONTEXT_FD"
-        __whyrun_last_history=$history_number
     fi
     return "$command_status"
 })bash";
 
-std::uint64_t parse_unsigned(std::string_view text, std::string_view field_name) {
+constexpr std::string_view kPromptFunction = R"bash(() {
+    local command_status="$1"
+    builtin trap - DEBUG
+    if (( __whyrun_active_command > 0 )); then
+        builtin printf 'E\0%s\0%s\0%s\0' \
+            "$__whyrun_active_command" "$command_status" "$PWD" \
+            >&"$WHYRUN_CONTEXT_FD"
+        __whyrun_active_command=0
+    fi
+    __whyrun_sequence=$((__whyrun_sequence + 1))
+    __whyrun_active_command=$__whyrun_sequence
+    builtin printf 'A\0%s\0%s\0\0' \
+        "$__whyrun_active_command" "$PWD" >&"$WHYRUN_CONTEXT_FD"
+    __whyrun_at_prompt=1
+    __whyrun_skip_debug=1
+    builtin trap '__whyrun_start "$?"' DEBUG
+    return "$command_status"
+})bash";
+
+std::uint64_t parse_id(std::string_view text) {
     std::uint64_t value{};
     const auto result = std::from_chars(text.data(), text.data() + text.size(), value);
-    if (result.ec != std::errc{} || result.ptr != text.data() + text.size()) {
-        throw std::runtime_error("invalid session " + std::string(field_name));
+    if (value == 0 || result.ec != std::errc{} ||
+        result.ptr != text.data() + text.size()) {
+        throw std::runtime_error("invalid command marker id");
     }
     return value;
 }
@@ -50,125 +68,100 @@ int parse_status(std::string_view text) {
     int value{};
     const auto result = std::from_chars(text.data(), text.data() + text.size(), value);
     if (result.ec != std::errc{} || result.ptr != text.data() + text.size()) {
-        throw std::runtime_error("invalid session exit status");
+        throw std::runtime_error("invalid command marker exit status");
     }
     return value;
 }
 
-std::uint64_t parse_epoch_ns(std::string_view text) {
-    const auto separator = text.find('.');
-    const auto seconds_text = text.substr(0, separator);
-    auto fractional = separator == std::string_view::npos
-                          ? std::string_view{}
-                          : text.substr(separator + 1);
-    if (fractional.size() > 9) {
-        fractional = fractional.substr(0, 9);
-    }
-
-    const auto seconds = parse_unsigned(seconds_text, "timestamp");
-    std::uint64_t nanoseconds = fractional.empty()
-                                    ? 0
-                                    : parse_unsigned(fractional, "timestamp");
-    for (std::size_t digits = fractional.size(); digits < 9; ++digits) {
-        nanoseconds *= 10;
-    }
-    if (seconds > (std::numeric_limits<std::uint64_t>::max() - nanoseconds) /
-                      1'000'000'000ULL) {
-        throw std::runtime_error("session timestamp is out of range");
-    }
-    return seconds * 1'000'000'000ULL + nanoseconds;
-}
-
-std::vector<std::string> read_fields(int fd) {
-    if (lseek(fd, 0, SEEK_SET) == -1) {
-        throw std::system_error(errno, std::generic_category(),
-                                "rewind session context");
-    }
-
-    std::string bytes;
-    std::array<char, 8192> buffer{};
-    for (;;) {
-        const ssize_t count = read(fd, buffer.data(), buffer.size());
-        if (count == 0) {
-            break;
-        }
-        if (count == -1) {
-            if (errno == EINTR) {
-                continue;
-            }
-            throw std::system_error(errno, std::generic_category(),
-                                    "read session context");
-        }
-        if (bytes.size() + static_cast<std::size_t>(count) > kMaximumContextBytes) {
-            throw std::runtime_error("session command context exceeds 64 MiB");
-        }
-        bytes.append(buffer.data(), static_cast<std::size_t>(count));
-    }
-
-    std::vector<std::string> fields;
-    std::size_t begin = 0;
-    while (begin < bytes.size()) {
-        const auto end = bytes.find('\0', begin);
-        if (end == std::string::npos) {
-            throw std::runtime_error("incomplete session command context");
-        }
-        fields.emplace_back(bytes.substr(begin, end - begin));
-        begin = end + 1;
-    }
-    if (fields.size() % kProtocolFields != 0) {
-        throw std::runtime_error("malformed session command context");
-    }
-    return fields;
-}
-
 }  // namespace
 
+std::vector<CommandMarker> CommandProtocol::consume(std::string_view bytes) {
+    std::vector<CommandMarker> markers;
+    for (const char byte : bytes) {
+        if (byte != '\0') {
+            if (pending_field_.size() == kMaximumFieldBytes) {
+                throw std::runtime_error("command marker field exceeds 64 KiB");
+            }
+            pending_field_.push_back(byte);
+            continue;
+        }
+
+        fields_.push_back(std::move(pending_field_));
+        pending_field_.clear();
+        if (fields_.size() == kProtocolFields) {
+            markers.push_back(decode_record());
+            fields_.clear();
+        }
+    }
+    return markers;
+}
+
+void CommandProtocol::finish() const {
+    if (!pending_field_.empty() || !fields_.empty()) {
+        throw std::runtime_error("incomplete command marker");
+    }
+}
+
+CommandMarker CommandProtocol::decode_record() const {
+    CommandMarker marker;
+    marker.id = parse_id(fields_[1]);
+    if (fields_[0] == "A") {
+        marker.type = CommandMarkerType::Arm;
+        marker.cwd = fields_[2];
+        if (!fields_[3].empty()) {
+            throw std::runtime_error("command arm marker has unexpected data");
+        }
+        return marker;
+    }
+    if (fields_[0] == "S") {
+        marker.type = CommandMarkerType::Start;
+        marker.cwd = fields_[2];
+        marker.text = fields_[3];
+        const auto history_prefix = marker.text.find('\034');
+        if (history_prefix == std::string::npos) {
+            throw std::runtime_error("command marker is missing its history prefix");
+        }
+        marker.text.erase(0, history_prefix + 1);
+        if (!marker.text.empty() && marker.text.back() == '\n') {
+            marker.text.pop_back();
+        }
+        return marker;
+    }
+    if (fields_[0] == "E") {
+        marker.type = CommandMarkerType::End;
+        marker.exit_code = parse_status(fields_[2]);
+        marker.cwd = fields_[3];
+        return marker;
+    }
+    throw std::runtime_error("unknown command marker type");
+}
+
 BashSession::BashSession() {
-    std::error_code temp_error;
-    const auto temp_directory = std::filesystem::temp_directory_path(temp_error);
-    if (temp_error) {
-        throw std::system_error(temp_error, "locate temporary directory");
-    }
-
-    std::string path_template = (temp_directory / "whyrun-session-XXXXXX").string();
-    std::vector<char> mutable_path(path_template.begin(), path_template.end());
-    mutable_path.push_back('\0');
-    const int temporary_fd = mkstemp(mutable_path.data());
-    if (temporary_fd == -1) {
+    const int null_fd = open("/dev/null", O_WRONLY | O_CLOEXEC);
+    if (null_fd == -1) {
         throw std::system_error(errno, std::generic_category(),
-                                "create session context");
-    }
-    if (unlink(mutable_path.data()) == -1) {
-        const int error = errno;
-        close(temporary_fd);
-        throw std::system_error(error, std::generic_category(),
-                                "unlink session context");
+                                "open command context sink");
     }
 
-    context_fd_ = fcntl(temporary_fd, F_DUPFD, 10);
+    context_fd_ = fcntl(null_fd, F_DUPFD, 10);
     const int duplicate_error = errno;
-    close(temporary_fd);
+    close(null_fd);
     if (context_fd_ == -1) {
         throw std::system_error(duplicate_error, std::generic_category(),
-                                "duplicate session context descriptor");
-    }
-
-    const int descriptor_flags = fcntl(context_fd_, F_GETFD);
-    if (descriptor_flags == -1 ||
-        fcntl(context_fd_, F_SETFD, descriptor_flags & ~FD_CLOEXEC) == -1) {
-        const int error = errno;
-        close(context_fd_);
-        context_fd_ = -1;
-        throw std::system_error(error, std::generic_category(),
-                                "configure session context");
+                                "duplicate command context descriptor");
     }
 
     request_.command = {"/bin/bash", "--noprofile", "--norc", "-i"};
+    request_.command_channel_fd = context_fd_;
     request_.environment = {
-        {"BASH_FUNC___whyrun_capture%%", std::string(kCaptureFunction)},
-        {"PROMPT_COMMAND", "__whyrun_capture \"$?\""},
+        {"BASH_FUNC___whyrun_start%%", std::string(kStartFunction)},
+        {"BASH_FUNC___whyrun_prompt%%", std::string(kPromptFunction)},
+        {"PROMPT_COMMAND", "__whyrun_prompt \"$?\""},
         {"WHYRUN_CONTEXT_FD", std::to_string(context_fd_)},
-        {"__whyrun_last_history", "0"},
+        {"__whyrun_at_prompt", "0"},
+        {"__whyrun_skip_debug", "0"},
+        {"__whyrun_sequence", "0"},
+        {"__whyrun_active_command", "0"},
         {"HISTFILE", ""},
         {"HISTCONTROL", ""},
         {"HISTIGNORE", ""},
@@ -181,40 +174,6 @@ BashSession::~BashSession() {
     if (context_fd_ != -1) {
         close(context_fd_);
     }
-}
-
-std::vector<RecordedCommand> BashSession::read_commands() {
-    if (commands_read_) {
-        throw std::logic_error("session commands have already been read");
-    }
-    commands_read_ = true;
-
-    const auto fields = read_fields(context_fd_);
-    std::vector<RecordedCommand> commands;
-    commands.reserve(fields.size() / kProtocolFields);
-    for (std::size_t index = 0; index < fields.size(); index += kProtocolFields) {
-        RecordedCommand command;
-        command.sequence = commands.size() + 1;
-        command.completed_ns = parse_epoch_ns(fields[index]);
-        const auto shell_pid = parse_unsigned(fields[index + 1], "shell pid");
-        if (shell_pid > static_cast<std::uint64_t>(std::numeric_limits<pid_t>::max())) {
-            throw std::runtime_error("session shell pid is out of range");
-        }
-        command.shell_pid = static_cast<pid_t>(shell_pid);
-        command.exit_code = parse_status(fields[index + 2]);
-        command.completed_cwd = fields[index + 3];
-        command.text = fields[index + 4];
-        const auto history_prefix = command.text.find('\034');
-        if (history_prefix == std::string::npos) {
-            throw std::runtime_error("session command is missing its history prefix");
-        }
-        command.text.erase(0, history_prefix + 1);
-        if (!command.text.empty() && command.text.back() == '\n') {
-            command.text.pop_back();
-        }
-        commands.push_back(std::move(command));
-    }
-    return commands;
 }
 
 }  // namespace whyrun

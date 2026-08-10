@@ -96,6 +96,12 @@ public:
         }
     }
 
+    void bind_null(int index) {
+        if (sqlite3_bind_null(statement_, index) != SQLITE_OK) {
+            throw std::runtime_error(sqlite3_errmsg(database_));
+        }
+    }
+
     void execute() {
         if (sqlite3_step(statement_) != SQLITE_DONE) {
             throw std::runtime_error(sqlite3_errmsg(database_));
@@ -216,13 +222,15 @@ public:
                 term_signal INTEGER
             );
             CREATE TABLE commands (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                id INTEGER PRIMARY KEY,
                 sequence INTEGER NOT NULL UNIQUE,
-                completed_ns INTEGER NOT NULL,
                 shell_pid INTEGER NOT NULL,
                 command TEXT NOT NULL,
-                completed_cwd TEXT,
-                exit_code INTEGER NOT NULL
+                cwd TEXT,
+                start_ns INTEGER NOT NULL,
+                end_ns INTEGER,
+                end_cwd TEXT,
+                exit_code INTEGER
             );
             CREATE TABLE processes (
                 pid INTEGER PRIMARY KEY,
@@ -242,7 +250,8 @@ public:
                 resource TEXT,
                 result INTEGER,
                 errno_value INTEGER,
-                metadata_json TEXT
+                metadata_json TEXT,
+                command_id INTEGER
             );
             CREATE TABLE file_activity (
                 path TEXT PRIMARY KEY,
@@ -260,13 +269,14 @@ public:
             );
             CREATE INDEX events_by_time ON events(timestamp_ns, id);
             CREATE INDEX events_by_errno ON events(errno_value);
-            CREATE INDEX commands_by_time ON commands(completed_ns, sequence);
+            CREATE INDEX events_by_command ON events(command_id, timestamp_ns, id);
+            CREATE INDEX commands_by_time ON commands(start_ns, sequence);
         )sql");
         database_.execute("BEGIN IMMEDIATE;");
 
         {
             Statement statement(database_.get(),
-                                "INSERT INTO metadata(key, value) VALUES('schema_version', '2')");
+                                "INSERT INTO metadata(key, value) VALUES('schema_version', '3')");
             statement.execute();
         }
         {
@@ -301,7 +311,7 @@ public:
         Statement insert_event(
             database_.get(),
             "INSERT INTO events(timestamp_ns, pid, tid, type, resource, result, "
-            "errno_value, metadata_json) VALUES(?, ?, ?, ?, ?, ?, ?, ?)");
+            "errno_value, metadata_json, command_id) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?)");
         insert_event.bind(1, as_i64(event.timestamp_ns));
         insert_event.bind(2, static_cast<std::int64_t>(event.pid));
         insert_event.bind(3, static_cast<std::int64_t>(event.tid));
@@ -310,9 +320,43 @@ public:
         insert_event.bind(6, event.result);
         insert_event.bind(7, static_cast<std::int64_t>(event.errno_value));
         insert_event.bind(8, metadata_json(event.metadata));
+        if (event.command_id.has_value()) {
+            insert_event.bind(9, as_i64(*event.command_id));
+        } else {
+            insert_event.bind_null(9);
+        }
         insert_event.execute();
 
-        if (event.type == EventType::FileRead || event.type == EventType::FileWrite) {
+        if (event.type == EventType::CommandStart) {
+            if (!event.command_id.has_value()) {
+                throw std::logic_error("command_start event has no command id");
+            }
+            Statement command(
+                database_.get(),
+                "INSERT INTO commands(id, sequence, shell_pid, command, cwd, start_ns) "
+                "VALUES(?, ?, ?, ?, ?, ?)");
+            command.bind(1, as_i64(*event.command_id));
+            command.bind(2, static_cast<std::int64_t>(
+                                std::stoll(metadata_value(event, "sequence", "0"))));
+            command.bind(3, static_cast<std::int64_t>(event.pid));
+            command.bind(4, event.resource);
+            command.bind(5, metadata_value(event, "cwd"));
+            command.bind(6, as_i64(event.timestamp_ns));
+            command.execute();
+        } else if (event.type == EventType::CommandEnd) {
+            if (!event.command_id.has_value()) {
+                throw std::logic_error("command_end event has no command id");
+            }
+            Statement command(
+                database_.get(),
+                "UPDATE commands SET end_ns=?, end_cwd=?, exit_code=? WHERE id=?");
+            command.bind(1, as_i64(event.timestamp_ns));
+            command.bind(2, metadata_value(event, "cwd"));
+            command.bind(3, event.result);
+            command.bind(4, as_i64(*event.command_id));
+            command.execute();
+        } else if (event.type == EventType::FileRead ||
+                   event.type == EventType::FileWrite) {
             Statement activity(
                 database_.get(),
                 "INSERT INTO file_activity(path, read_calls, write_calls, bytes_read, "
@@ -380,20 +424,6 @@ public:
         }
     }
 
-    void add_command(const RecordedCommand& command) {
-        Statement statement(
-            database_.get(),
-            "INSERT INTO commands(sequence, completed_ns, shell_pid, command, "
-            "completed_cwd, exit_code) VALUES(?, ?, ?, ?, ?, ?)");
-        statement.bind(1, as_i64(command.sequence));
-        statement.bind(2, as_i64(command.completed_ns));
-        statement.bind(3, static_cast<std::int64_t>(command.shell_pid));
-        statement.bind(4, command.text);
-        statement.bind(5, command.completed_cwd);
-        statement.bind(6, static_cast<std::int64_t>(command.exit_code));
-        statement.execute();
-    }
-
     void finish(const CollectionResult& result) {
         if (finished_) {
             throw std::logic_error("capsule has already been finalized");
@@ -422,10 +452,6 @@ CapsuleWriter& CapsuleWriter::operator=(CapsuleWriter&&) noexcept = default;
 
 void CapsuleWriter::emit(const Event& event) {
     impl_->emit(event);
-}
-
-void CapsuleWriter::add_command(const RecordedCommand& command) {
-    impl_->add_command(command);
 }
 
 void CapsuleWriter::finish(const CollectionResult& result) {

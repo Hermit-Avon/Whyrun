@@ -1,7 +1,6 @@
 #pragma once
 
 #include "whyrun/collector.hpp"
-#include "whyrun/session.hpp"
 
 #include <cstdint>
 #include <filesystem>
@@ -38,7 +37,6 @@ public:
     CapsuleWriter& operator=(CapsuleWriter&&) noexcept;
 
     void emit(const Event& event) override;
-    void add_command(const RecordedCommand& command);
     void finish(const CollectionResult& result);
 
 private:

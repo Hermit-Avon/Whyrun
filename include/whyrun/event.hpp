@@ -1,6 +1,7 @@
 #pragma once
 
 #include <cstdint>
+#include <optional>
 #include <string>
 #include <string_view>
 #include <sys/types.h>
@@ -9,6 +10,9 @@
 namespace whyrun {
 
 enum class EventType {
+    CommandStart,
+    CommandEnd,
+
     ProcessExec,
     ProcessFork,
     ProcessExit,
@@ -28,6 +32,7 @@ struct Event {
     std::int64_t result{};
     int errno_value{};
     std::unordered_map<std::string, std::string> metadata;
+    std::optional<std::uint64_t> command_id;
 };
 
 std::string_view event_type_name(EventType type);

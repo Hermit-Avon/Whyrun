@@ -1,7 +1,10 @@
 #include "whyrun/collector.hpp"
 #include "whyrun/execution_state.hpp"
+#include "whyrun/session.hpp"
 
+#include <fcntl.h>
 #include <sys/ptrace.h>
+#include <sys/syscall.h>
 #include <sys/uio.h>
 #include <sys/user.h>
 #include <sys/wait.h>
@@ -23,6 +26,8 @@
 
 namespace whyrun {
 namespace {
+
+constexpr std::size_t kMaximumCommandWrite = 65U * 1024U;
 
 std::uint64_t now_ns() {
     const auto now = std::chrono::system_clock::now().time_since_epoch();
@@ -113,6 +118,58 @@ struct ThreadState {
     std::array<std::uint64_t, 6> args{};
 };
 
+class CommandChannelTracker {
+public:
+    explicit CommandChannelTracker(const std::optional<int>& channel_fd) {
+        if (channel_fd.has_value()) {
+            aliases_.insert(*channel_fd);
+        }
+    }
+
+    bool receives(const RawSyscall& syscall) const {
+        return syscall.number == __NR_write &&
+               aliases_.contains(static_cast<int>(syscall.args[0]));
+    }
+
+    void observe(const RawSyscall& syscall) {
+        if (syscall.result < 0) {
+            return;
+        }
+
+        const int source = static_cast<int>(syscall.args[0]);
+        if (syscall.number == __NR_close) {
+            aliases_.erase(source);
+            return;
+        }
+        if (syscall.number == __NR_dup) {
+            assign_alias(static_cast<int>(syscall.result), aliases_.contains(source));
+            return;
+        }
+        if (syscall.number == __NR_dup2 || syscall.number == __NR_dup3) {
+            const int destination = static_cast<int>(syscall.args[1]);
+            if (source != destination) {
+                assign_alias(destination, aliases_.contains(source));
+            }
+            return;
+        }
+        if (syscall.number == __NR_fcntl &&
+            (syscall.args[1] == F_DUPFD || syscall.args[1] == F_DUPFD_CLOEXEC)) {
+            assign_alias(static_cast<int>(syscall.result), aliases_.contains(source));
+        }
+    }
+
+private:
+    void assign_alias(int fd, bool is_alias) {
+        if (is_alias) {
+            aliases_.insert(fd);
+        } else {
+            aliases_.erase(fd);
+        }
+    }
+
+    std::unordered_set<int> aliases_;
+};
+
 class TraceeGuard {
 public:
     explicit TraceeGuard(std::unordered_set<pid_t>& tids) : tids_(tids) {}
@@ -124,7 +181,22 @@ public:
         for (const pid_t tid : tids_) {
             static_cast<void>(kill(tid, SIGKILL));
         }
-        while (waitpid(-1, nullptr, __WALL) > 0) {
+        while (!tids_.empty()) {
+            int status{};
+            const pid_t tid = waitpid(-1, &status, __WALL);
+            if (tid == -1) {
+                if (errno == EINTR) {
+                    continue;
+                }
+                break;
+            }
+            if (WIFEXITED(status) || WIFSIGNALED(status)) {
+                tids_.erase(tid);
+            } else if (WIFSTOPPED(status)) {
+                static_cast<void>(ptrace(
+                    PTRACE_CONT, tid, nullptr,
+                    reinterpret_cast<void*>(static_cast<std::intptr_t>(SIGKILL))));
+            }
         }
     }
 
@@ -234,7 +306,10 @@ public:
 
         LinuxTraceeMemory memory;
         ExecutionState execution(sink, memory);
-        execution.add_initial_process(root_pid, initial_cwd);
+        execution.add_initial_process(root_pid, initial_cwd, request.root_command,
+                                      now_ns());
+        CommandProtocol command_protocol;
+        CommandChannelTracker command_channel(request.command_channel_fd);
 
         std::unordered_set<pid_t> live_tids{root_pid};
         TraceeGuard tracee_guard(live_tids);
@@ -315,6 +390,28 @@ public:
                         syscall.args = thread.args;
                         syscall.result = static_cast<std::int64_t>(registers.rax);
                         syscall.timestamp_ns = now_ns();
+
+                        if (tid == root_pid && command_channel.receives(syscall) &&
+                            syscall.result > 0) {
+                            const auto count = static_cast<std::uint64_t>(syscall.result);
+                            if (count > kMaximumCommandWrite) {
+                                throw std::runtime_error(
+                                    "command marker write exceeds 65 KiB");
+                            }
+                            std::string bytes(static_cast<std::size_t>(count), '\0');
+                            if (!memory.read_bytes(tid, syscall.args[1], bytes.data(),
+                                                   bytes.size())) {
+                                throw std::runtime_error(
+                                    "cannot read command marker from tracee");
+                            }
+                            for (const auto& marker : command_protocol.consume(bytes)) {
+                                execution.on_command_marker(tid, marker,
+                                                            syscall.timestamp_ns);
+                            }
+                        }
+                        if (tid == root_pid) {
+                            command_channel.observe(syscall);
+                        }
                         execution.on_syscall_exit(syscall);
                         thread.in_syscall = false;
                     }
@@ -361,6 +458,9 @@ public:
 
         result.collector_ok = true;
         result.end_ns = now_ns();
+        if (request.command_channel_fd.has_value()) {
+            command_protocol.finish();
+        }
         if (!root_status_seen) {
             result.collector_ok = false;
             result.error = "root tracee status was not observed";

@@ -6,6 +6,10 @@ namespace whyrun {
 
 std::string_view event_type_name(EventType type) {
     switch (type) {
+        case EventType::CommandStart:
+            return "command_start";
+        case EventType::CommandEnd:
+            return "command_end";
         case EventType::ProcessExec:
             return "process_exec";
         case EventType::ProcessFork:

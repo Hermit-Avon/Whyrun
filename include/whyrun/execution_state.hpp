@@ -12,6 +12,8 @@
 
 namespace whyrun {
 
+struct CommandMarker;
+
 enum class ResourceType {
     File,
     Socket,
@@ -30,6 +32,7 @@ struct ProcessState {
     pid_t parent_pid{};
     std::string executable;
     std::string cwd;
+    std::optional<std::uint64_t> command_id;
     std::unordered_map<int, Resource> fd_table;
 };
 
@@ -55,7 +58,11 @@ class ExecutionState {
 public:
     ExecutionState(EventSink& sink, const TraceeMemory& memory);
 
-    void add_initial_process(pid_t pid, std::string cwd);
+    void add_initial_process(pid_t pid, std::string cwd,
+                             const std::optional<std::string>& root_command,
+                             std::uint64_t timestamp_ns);
+    void on_command_marker(pid_t tid, const CommandMarker& marker,
+                           std::uint64_t timestamp_ns);
     void on_process_exec(pid_t tid, std::uint64_t timestamp_ns);
     void on_process_created(pid_t parent_tid, pid_t child_tid,
                             unsigned int ptrace_event, std::uint64_t clone_flags,
@@ -68,6 +75,12 @@ public:
     pid_t process_for_thread(pid_t tid) const;
 
 private:
+    struct ActiveCommand {
+        std::uint64_t id{};
+        std::optional<std::uint64_t> first_process_ns;
+        bool started{false};
+    };
+
     ProcessState* find_process_for_thread(pid_t tid);
     const ProcessState* find_process_for_thread(pid_t tid) const;
     std::string resolve_path(const ProcessState& process, int dirfd,
@@ -78,7 +91,8 @@ private:
     const TraceeMemory& memory_;
     std::unordered_map<pid_t, ProcessState> processes_;
     std::unordered_map<pid_t, pid_t> thread_to_process_;
+    std::optional<ActiveCommand> active_command_;
+    pid_t root_pid_{};
 };
 
 }  // namespace whyrun
-

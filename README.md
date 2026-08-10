@@ -64,9 +64,10 @@ Record an interactive Bash session:
 ```
 
 Run commands normally, then use `exit` or `Ctrl-D` to finish and publish the
-capsule. WhyRun records each completed shell command with its completion-time
-working directory and exit code while ptrace independently records the process
-tree and semantic OS activity.
+capsule. WhyRun records each shell command with its working directory, exit
+status, process lineage, and semantic OS activity. A background process keeps
+the identity of the command that launched it, even after Bash displays the next
+prompt.
 
 Record one command instead:
 
@@ -83,6 +84,18 @@ Show its semantic summary or timeline:
 ./build/whyrun show run-20260809-185501.wrun
 ./build/whyrun show run-20260809-185501.wrun --events
 ```
+
+For an interactive session, select one command by the number shown in the
+summary. This filters files, network endpoints, local IPC, errors, processes,
+and the optional timeline to that command's process tree:
+
+```bash
+./build/whyrun show run-20260809-185501.wrun --command 2
+./build/whyrun show run-20260809-185501.wrun --command 2 --events
+```
+
+One-shot recordings also have an implicit command `1`, so the same query works
+for both recording modes.
 
 Compare two executions:
 
@@ -131,8 +144,12 @@ PtraceCollector
   -> SQLite .wrun capsule
 
 BashSession
-  -> shell command / cwd / exit status context
-  -> CapsuleWriter commands table
+  -> in-band command arm/start/end markers
+  -> PtraceCollector control-FD correlation
+  -> ExecutionState command/process lineage
+
+semantic Event + command_id
+  -> CapsuleWriter commands/events tables
 
 SQLite capsule -> show summary / event timeline
 two capsules   -> aggregate diff
@@ -153,18 +170,23 @@ read, write, close, dup, and connect calls. Child processes inherit a snapshot
 of the parent's FD table and cwd.
 
 Each newly recorded `.wrun` file is a self-contained SQLite database with schema
-version `2`; `show` and `diff` also accept version `1` capsules. It contains run,
-process, and optional shell command records, semantic events, aggregated file
-activity, and aggregated network activity. Negative Linux syscall results are
-stored alongside their positive errno value.
+version `3`; `show` and `diff` also accept version `1` and `2` capsules. It
+contains run and process records, command boundaries, semantic events with an
+optional command ID, and aggregate file and network activity. Negative Linux
+syscall results are stored alongside their positive errno value. Per-command
+views require a version `3` capsule.
 
 ## Current Limitations
 
 - Linux x86_64 syscall ABI only.
 - Interactive sessions currently use a clean `/bin/bash` launched with
   `--noprofile --norc`; user startup files and other shells are not yet supported.
-- Session command context is reported by Bash. Ptrace remains the source of
-  truth for observed processes, files, network activity, and errors.
+- One interactive input line is one command unit. Pipelines, compound commands,
+  and commands separated on the same line are intentionally grouped together.
+- Session command boundaries are reported by Bash over an internal descriptor.
+  Ptrace captures those markers in syscall order and remains the source of truth
+  for observed processes, files, network activity, and errors. Shell startup
+  activity before the first prompt is intentionally not assigned to a command.
 - The v0.1 collector uses ptrace and has its runtime overhead and permission
   constraints.
 - FD tables are copied at fork/clone time; `CLONE_FILES` sharing is not modeled.

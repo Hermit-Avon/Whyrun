@@ -80,6 +80,10 @@ public:
                                 : reinterpret_cast<const char*>(value);
     }
 
+    bool is_null(int column) const {
+        return sqlite3_column_type(statement_, column) == SQLITE_NULL;
+    }
+
 private:
     sqlite3* database_{};
     sqlite3_stmt* statement_{};
@@ -92,11 +96,11 @@ inline int validate_schema(sqlite3* database) {
         throw std::runtime_error("not a WhyRun capsule: schema_version is missing");
     }
     const std::string version = statement.text(0);
-    if (version != "1" && version != "2") {
+    if (version != "1" && version != "2" && version != "3") {
         throw std::runtime_error("unsupported WhyRun capsule schema version " +
                                  version);
     }
-    return version == "1" ? 1 : 2;
+    return version == "1" ? 1 : (version == "2" ? 2 : 3);
 }
 
 }  // namespace whyrun::detail

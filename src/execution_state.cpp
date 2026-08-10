@@ -1,5 +1,7 @@
 #include "whyrun/execution_state.hpp"
 
+#include "whyrun/session.hpp"
+
 #include <arpa/inet.h>
 #include <fcntl.h>
 #include <linux/openat2.h>
@@ -20,6 +22,7 @@
 #include <limits>
 #include <optional>
 #include <sstream>
+#include <stdexcept>
 #include <system_error>
 
 namespace whyrun {
@@ -168,12 +171,28 @@ std::string child_kind(unsigned int ptrace_event) {
 ExecutionState::ExecutionState(EventSink& sink, const TraceeMemory& memory)
     : sink_(sink), memory_(memory) {}
 
-void ExecutionState::add_initial_process(pid_t pid, std::string cwd) {
+void ExecutionState::add_initial_process(
+    pid_t pid, std::string cwd, const std::optional<std::string>& root_command,
+    std::uint64_t timestamp_ns) {
     ProcessState process;
     process.pid = pid;
     process.cwd = std::move(cwd);
+    if (root_command.has_value()) {
+        process.command_id = 1;
+        active_command_ = ActiveCommand{1, timestamp_ns, true};
+    }
     processes_.insert_or_assign(pid, std::move(process));
     thread_to_process_[pid] = pid;
+    root_pid_ = pid;
+
+    if (root_command.has_value()) {
+        Event event{timestamp_ns, pid, pid, EventType::CommandStart,
+                    *root_command, 0, 0, {}, std::nullopt};
+        event.metadata["cwd"] = processes_.at(pid).cwd;
+        event.metadata["sequence"] = "1";
+        event.command_id = 1;
+        emit(std::move(event));
+    }
 }
 
 pid_t ExecutionState::process_for_thread(pid_t tid) const {
@@ -194,13 +213,74 @@ const ProcessState* ExecutionState::find_process_for_thread(pid_t tid) const {
 }
 
 void ExecutionState::emit(Event event) const {
+    if (!event.command_id.has_value()) {
+        const auto* process = find_process_for_thread(event.tid);
+        const bool root_is_armed = process != nullptr && process->pid == root_pid_ &&
+                                   active_command_.has_value() &&
+                                   !active_command_->started;
+        if (process != nullptr && !root_is_armed) {
+            event.command_id = process->command_id;
+        }
+    }
     sink_.emit(event);
+}
+
+void ExecutionState::on_command_marker(pid_t tid, const CommandMarker& marker,
+                                       std::uint64_t timestamp_ns) {
+    auto* process = find_process_for_thread(tid);
+    if (process == nullptr || process->pid != root_pid_) {
+        return;
+    }
+
+    if (marker.type == CommandMarkerType::Arm) {
+        if (active_command_.has_value() || process->command_id.has_value()) {
+            throw std::runtime_error("command armed before the previous command ended");
+        }
+        process->command_id = marker.id;
+        active_command_ = ActiveCommand{marker.id, std::nullopt, false};
+        return;
+    }
+
+    if (marker.type == CommandMarkerType::Start) {
+        if (!active_command_.has_value() || active_command_->id != marker.id ||
+            active_command_->started || !process->command_id.has_value() ||
+            *process->command_id != marker.id) {
+            throw std::runtime_error("command start marker does not match the armed command");
+        }
+        active_command_->started = true;
+        Event event{active_command_->first_process_ns.value_or(timestamp_ns),
+                    process->pid, tid,
+                    EventType::CommandStart,
+                    marker.text, 0, 0, {}, std::nullopt};
+        event.metadata["cwd"] = marker.cwd;
+        event.metadata["sequence"] = std::to_string(marker.id);
+        event.command_id = marker.id;
+        emit(std::move(event));
+        return;
+    }
+
+    if (!active_command_.has_value() || active_command_->id != marker.id ||
+        !active_command_->started || !process->command_id.has_value() ||
+        *process->command_id != marker.id) {
+        throw std::runtime_error("command end marker does not match the active command");
+    }
+    Event event{timestamp_ns, process->pid, tid, EventType::CommandEnd,
+                {}, marker.exit_code, 0, {}, std::nullopt};
+    event.metadata["cwd"] = marker.cwd;
+    event.command_id = marker.id;
+    emit(std::move(event));
+    process->command_id.reset();
+    active_command_.reset();
 }
 
 void ExecutionState::on_process_exec(pid_t tid, std::uint64_t timestamp_ns) {
     auto* process = find_process_for_thread(tid);
     if (process == nullptr) {
-        add_initial_process(tid, read_proc_link(tid, "cwd"));
+        ProcessState discovered;
+        discovered.pid = tid;
+        discovered.cwd = read_proc_link(tid, "cwd");
+        processes_.insert_or_assign(tid, std::move(discovered));
+        thread_to_process_[tid] = tid;
         process = find_process_for_thread(tid);
     }
 
@@ -211,7 +291,7 @@ void ExecutionState::on_process_exec(pid_t tid, std::uint64_t timestamp_ns) {
     process->executable = executable;
 
     Event event{timestamp_ns, process->pid, tid, EventType::ProcessExec,
-                executable, 0, 0, {}};
+                executable, 0, 0, {}, std::nullopt};
     event.metadata["ppid"] = std::to_string(process->parent_pid);
     emit(std::move(event));
 }
@@ -232,17 +312,26 @@ void ExecutionState::on_process_created(pid_t parent_tid, pid_t child_tid,
         return;
     }
 
+    const pid_t parent_pid = parent->pid;
+    const std::string parent_executable = parent->executable;
+    const auto command_id = parent->command_id;
     ProcessState child = *parent;
     child.pid = child_tid;
-    child.parent_pid = parent->pid;
+    child.parent_pid = parent_pid;
     processes_.insert_or_assign(child_tid, std::move(child));
     thread_to_process_[child_tid] = child_tid;
 
-    Event event{timestamp_ns, parent->pid, parent_tid, EventType::ProcessFork,
-                std::to_string(child_tid), child_tid, 0, {}};
+    if (parent_pid == root_pid_ && active_command_.has_value() &&
+        !active_command_->started && !active_command_->first_process_ns.has_value()) {
+        active_command_->first_process_ns = timestamp_ns;
+    }
+
+    Event event{timestamp_ns, parent_pid, parent_tid, EventType::ProcessFork,
+                std::to_string(child_tid), child_tid, 0, {}, std::nullopt};
     event.metadata["child_pid"] = std::to_string(child_tid);
     event.metadata["kind"] = child_kind(ptrace_event);
-    event.metadata["executable"] = parent->executable;
+    event.metadata["executable"] = parent_executable;
+    event.command_id = command_id;
     emit(std::move(event));
 }
 
@@ -259,12 +348,32 @@ void ExecutionState::on_process_exit(pid_t tid, int exit_code, int term_signal,
         return;
     }
 
+    const bool root_has_unstarted_command =
+        process->pid == root_pid_ && active_command_.has_value() &&
+        !active_command_->started;
+    if (root_has_unstarted_command) {
+        process->command_id.reset();
+    }
+
     const int result = term_signal == 0 ? exit_code : 128 + term_signal;
     Event event{timestamp_ns, process->pid, tid, EventType::ProcessExit,
-                process->executable, result, 0, {}};
+                process->executable, result, 0, {}, std::nullopt};
     event.metadata["exit_code"] = std::to_string(exit_code);
     event.metadata["term_signal"] = std::to_string(term_signal);
     emit(std::move(event));
+
+    if (process->pid == root_pid_ && active_command_.has_value() &&
+        active_command_->started && process->command_id.has_value()) {
+        Event command_end{timestamp_ns, process->pid, tid, EventType::CommandEnd,
+                          {}, result, 0, {}, std::nullopt};
+        command_end.metadata["cwd"] = process->cwd;
+        command_end.command_id = process->command_id;
+        emit(std::move(command_end));
+        process->command_id.reset();
+    }
+    if (process->pid == root_pid_) {
+        active_command_.reset();
+    }
     thread_to_process_.erase(tid);
 }
 
@@ -300,7 +409,8 @@ void ExecutionState::on_syscall_exit(const RawSyscall& syscall) {
     const auto make_event = [&](EventType type, std::string resource,
                                 std::int64_t result) {
         Event event{syscall.timestamp_ns, process->pid, syscall.tid, type,
-                    std::move(resource), result, syscall_errno(result), {}};
+                    std::move(resource), result, syscall_errno(result), {},
+                    std::nullopt};
         return event;
     };
 

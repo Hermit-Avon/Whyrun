@@ -4,6 +4,7 @@
 #include "whyrun/store.hpp"
 #include "whyrun/version.hpp"
 
+#include <charconv>
 #include <chrono>
 #include <filesystem>
 #include <iostream>
@@ -78,9 +79,10 @@ bool print_command_help(std::string_view command, std::ostream& output) {
     }
     if (command == "show") {
         output << "Usage:\n"
-                  "  whyrun show <capsule.wrun> [--events]\n\n"
+                  "  whyrun show <capsule.wrun> [--events] [--command <id>]\n\n"
                   "Options:\n"
-                  "  --events  Include the semantic event timeline\n";
+                  "  --events        Include the semantic event timeline\n"
+                  "  --command <id>  Show effects attributed to one command\n";
         return true;
     }
     if (command == "diff") {
@@ -135,6 +137,7 @@ int record_command(int argc, char** argv) {
             for (int index = 3; index < argc; ++index) {
                 request.command.emplace_back(argv[index]);
             }
+            request.root_command = whyrun::format_command(request.command);
         }
 
         const auto capsule_path = whyrun::default_capsule_path();
@@ -163,11 +166,6 @@ int record_command(int argc, char** argv) {
             whyrun::CapsuleWriter writer(temporary_path, metadata);
             auto collector = whyrun::make_ptrace_collector();
             result = collector->collect(request, writer);
-            if (session) {
-                for (const auto& command : session->read_commands()) {
-                    writer.add_command(command);
-                }
-            }
             writer.finish(result);
         }
         whyrun::publish_capsule(temporary_path, capsule_path);
@@ -183,6 +181,49 @@ int record_command(int argc, char** argv) {
         std::cerr << "whyrun record: " << error.what() << '\n';
         return 1;
     }
+}
+
+int show_command(int argc, char** argv) {
+    if (argc < 3) {
+        std::cerr << "whyrun show: expected a capsule path\n";
+        std::cerr << "Try 'whyrun help show'.\n";
+        return 2;
+    }
+
+    whyrun::ShowOptions options;
+    for (int index = 3; index < argc; ++index) {
+        const std::string_view option = argv[index];
+        if (option == "--events") {
+            options.events = true;
+            continue;
+        }
+        if (option == "--command") {
+            if (options.command_id.has_value()) {
+                std::cerr << "whyrun show: --command may only be specified once\n";
+                return 2;
+            }
+            if (++index == argc) {
+                std::cerr << "whyrun show: --command requires an id\n";
+                return 2;
+            }
+            std::int64_t command_id{};
+            const std::string_view value = argv[index];
+            const auto parsed = std::from_chars(value.data(),
+                                                value.data() + value.size(),
+                                                command_id);
+            if (parsed.ec != std::errc{} ||
+                parsed.ptr != value.data() + value.size() || command_id <= 0) {
+                std::cerr << "whyrun show: invalid command id: " << value << '\n';
+                return 2;
+            }
+            options.command_id = command_id;
+            continue;
+        }
+        std::cerr << "whyrun show: unknown option: " << option << '\n';
+        std::cerr << "Try 'whyrun help show'.\n";
+        return 2;
+    }
+    return whyrun::show_capsule(argv[2], options);
 }
 
 }  // namespace
@@ -224,18 +265,7 @@ int main(int argc, char** argv) {
         return record_command(argc, argv);
     }
     if (command == "show") {
-        if (argc != 3 && argc != 4) {
-            std::cerr << "whyrun show: expected a capsule path and optional --events\n";
-            std::cerr << "Try 'whyrun help show'.\n";
-            return 2;
-        }
-        const bool events = argc == 4 && std::string_view(argv[3]) == "--events";
-        if (argc == 4 && !events) {
-            std::cerr << "whyrun show: unknown option: " << argv[3] << '\n';
-            std::cerr << "Try 'whyrun help show'.\n";
-            return 2;
-        }
-        return whyrun::show_capsule(argv[2], events);
+        return show_command(argc, argv);
     }
     if (command == "diff") {
         if (argc != 4) {

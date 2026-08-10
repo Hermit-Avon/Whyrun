@@ -4,6 +4,7 @@
 
 #include <cstdint>
 #include <memory>
+#include <optional>
 #include <string>
 #include <utility>
 #include <vector>
@@ -21,6 +22,8 @@ struct CollectionResult {
 struct CollectionRequest {
     std::vector<std::string> command;
     std::vector<std::pair<std::string, std::string>> environment;
+    std::optional<std::string> root_command;
+    std::optional<int> command_channel_fd;
 };
 
 class Collector {

@@ -17,6 +17,9 @@ printf 'WhyRun integration input\n' > input.txt
 true_capsule=$(ls -1t run-*.wrun | head -1)
 "$whyrun" show "$true_capsule" > true.show
 grep -q '/bin/true' true.show
+"$whyrun" show "$true_capsule" --command 1 > true-command.show
+grep -q '^Command 1$' true-command.show
+grep -q '/bin/true' true-command.show
 
 "$whyrun" record -- "$test_file" "$work/input.txt" "$work/output.txt" > file.log
 file_capsule=$(ls -1t run-*.wrun | head -1)
@@ -37,6 +40,9 @@ network_capsule=$(ls -1t run-*.wrun | head -1)
 "$whyrun" show "$network_capsule" > network.show
 grep -q '127.0.0.1:1' network.show
 grep -q 'ECONNREFUSED' network.show
+"$whyrun" show "$network_capsule" --command 1 > network-command.show
+grep -q '127.0.0.1:1' network-command.show
+grep -q 'ECONNREFUSED' network-command.show
 
 unix_path="$work/missing.sock"
 "$whyrun" record -- "$test_unix" "$unix_path" > unix.log
@@ -66,9 +72,41 @@ grep -Fq 'echo $? (exit 0)' session.show
 grep -q "$work/input.txt" session.show
 fork_count=$(grep -c ' process_fork ' session.show)
 [ "$fork_count" -eq 1 ]
+"$whyrun" show "$session_capsule" --command 1 --events > session-command-1.show
+grep -q '^Command 1$' session-command-1.show
+grep -q "$work/input.txt" session-command-1.show
+grep -q ' process_exec ' session-command-1.show
+"$whyrun" show "$session_capsule" --command 2 > session-command-2.show
+grep -Fq 'false' session-command-2.show
+grep -Fq 'code 1' session-command-2.show
+if grep -q "$work/input.txt" session-command-2.show; then
+    exit 1
+fi
 "$whyrun" diff "$true_capsule" "$session_capsule" > session.diff
 grep -q '^Commands$' session.diff
 grep -Fq "+ cat '$work/input.txt'" session.diff
+
+printf "(sleep 0.1; cat '%s' >/dev/null) &\necho foreground\nwait\nexit 0\n" \
+    "$work/input.txt" > background.input
+"$whyrun" record < background.input > background.log 2> background.stderr
+background_capsule=$(ls -1t run-*.wrun | head -1)
+"$whyrun" show "$background_capsule" --command 1 --events > background-command-1.show
+grep -q "$work/input.txt" background-command-1.show
+grep -q ' process_fork ' background-command-1.show
+if grep -q '/etc/inputrc' background-command-1.show; then
+    exit 1
+fi
+"$whyrun" show "$background_capsule" --command 2 > background-command-2.show
+grep -Fq 'echo foreground' background-command-2.show
+if grep -q "$work/input.txt" background-command-2.show; then
+    exit 1
+fi
+
+"$whyrun" record < /dev/null > empty-session.log 2> empty-session.stderr
+empty_capsule=$(ls -1t run-*.wrun | head -1)
+"$whyrun" show "$empty_capsule" > empty-session.show
+grep -q '^Commands$' empty-session.show
+grep -A1 '^Commands$' empty-session.show | grep -q '  none'
 
 visibility="$work/visibility"
 mkdir -p "$visibility"
